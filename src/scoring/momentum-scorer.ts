@@ -50,11 +50,15 @@ class RunningStats {
    */
   getZScore(value: number): number {
     const stdDev = this.getStdDev();
-    if (stdDev === 0 || this.n < 10) {
+    if (stdDev === 0 || this.n < 2) {
       // Not enough data for meaningful z-score
       return 0;
     }
-    return (value - this.mean) / stdDev;
+    // Allow early scoring while the stats are warming up.
+    // This keeps paper/live behavior aligned without requiring 10+ samples.
+    const z = (value - this.mean) / stdDev;
+    // Clamp to reduce noise spikes from tiny sample sizes.
+    return Math.max(-6, Math.min(6, z));
   }
   
   /**
