@@ -108,12 +108,20 @@ export function logEvent(type: LogEventType, data: Record<string, unknown>): voi
     case LogEventType.EXIT_SIGNAL:
     case LogEventType.POSITION_OPENED:
     case LogEventType.POSITION_CLOSED:
+    case LogEventType.PHASE2_VERIFIED:
+    case LogEventType.RPC_COUNTERS:
       logger.info(type, data);
       break;
     case LogEventType.SWAP_DETECTED:
     case LogEventType.RISK_GATE_CHECK:
     case LogEventType.TOKEN_ENTERED_UNIVERSE:
     case LogEventType.TOKEN_EXITED_UNIVERSE:
+    case LogEventType.PHASE1_CANDIDATE_SEEN:
+    case LogEventType.PHASE1_HOT_TRIGGERED:
+    case LogEventType.PHASE1_COOLDOWN_SKIP:
+    case LogEventType.PHASE2_STARTED:
+    case LogEventType.PHASE2_REJECTED:
+    case LogEventType.PHASE2_NOISE_REJECTED:
       logger.debug(type, data);
       break;
     default:

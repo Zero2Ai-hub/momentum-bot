@@ -30,6 +30,9 @@ export class TokenUniverse extends EventEmitter<TokenUniverseEvents> {
   // Set of mints that failed verification (don't re-verify)
   private rejectedMints = new Set<string>();
   
+  // P1-7: Track mints that have exited to prevent duplicate exit events
+  private exitedMints = new Set<string>();
+  
   constructor() {
     super();
     this.inactivityTimeoutMs = getConfig().tokenInactivityTimeoutMs;
@@ -100,6 +103,10 @@ export class TokenUniverse extends EventEmitter<TokenUniverseEvents> {
       // VALIDATED: Create new token state
       state = new TokenState(tokenMint, event);
       this.tokens.set(tokenMint, state);
+      
+      // P1-7: Clear exit flag for re-entry (clean lifecycle)
+      this.exitedMints.delete(tokenMint);
+      
       this.emit('token:entered', tokenMint, state);
     } else {
       // Existing token - update state
@@ -145,6 +152,10 @@ export class TokenUniverse extends EventEmitter<TokenUniverseEvents> {
       // Verified: Create new token state
       state = new TokenState(tokenMint, event);
       this.tokens.set(tokenMint, state);
+      
+      // P1-7: Clear exit flag for re-entry (clean lifecycle)
+      this.exitedMints.delete(tokenMint);
+      
       this.emit('token:entered', tokenMint, state);
     } else {
       state.processSwap(event);
@@ -184,10 +195,12 @@ export class TokenUniverse extends EventEmitter<TokenUniverseEvents> {
   
   /**
    * Manually remove a token (for testing or forced cleanup)
+   * P1-7: Idempotent - only emits exit event once per lifecycle
    */
   removeToken(tokenMint: string): boolean {
     const existed = this.tokens.delete(tokenMint);
-    if (existed) {
+    if (existed && !this.exitedMints.has(tokenMint)) {
+      this.exitedMints.add(tokenMint);
       this.emit('token:exited', tokenMint);
     }
     return existed;
@@ -195,6 +208,7 @@ export class TokenUniverse extends EventEmitter<TokenUniverseEvents> {
   
   /**
    * Remove inactive tokens
+   * P1-7: Idempotent exits - each mint only emits one exit event per lifecycle
    */
   private cleanup(): void {
     const now = Date.now();
@@ -211,22 +225,35 @@ export class TokenUniverse extends EventEmitter<TokenUniverseEvents> {
     }
     
     for (const mint of toRemove) {
-      const state = this.tokens.get(mint)!;
+      const state = this.tokens.get(mint);
+      if (!state) continue;
       
-      logEvent(LogEventType.TOKEN_EXITED_UNIVERSE, {
-        tokenMint: mint,
-        totalSwaps: state.allTimeSwapCount,
-        lifetimeMs: now - state.firstSeenTimestamp,
-      });
+      // P1-7: Only emit exit event if not already exited
+      if (!this.exitedMints.has(mint)) {
+        this.exitedMints.add(mint);
+        
+        logEvent(LogEventType.TOKEN_EXITED_UNIVERSE, {
+          tokenMint: mint,
+          totalSwaps: state.allTimeSwapCount,
+          lifetimeMs: now - state.firstSeenTimestamp,
+        });
+        
+        this.emit('token:exited', mint);
+      }
       
       this.tokens.delete(mint);
-      this.emit('token:exited', mint);
     }
     
-    // Cleanup rejected mints periodically (keep last 10000)
+    // Cleanup caches periodically
     if (this.rejectedMints.size > 10000) {
       const arr = Array.from(this.rejectedMints);
       this.rejectedMints = new Set(arr.slice(-5000));
+    }
+    
+    // Cleanup exited mints cache (older than 5 minutes can be re-entered)
+    if (this.exitedMints.size > 5000) {
+      const arr = Array.from(this.exitedMints);
+      this.exitedMints = new Set(arr.slice(-2500));
     }
   }
   
@@ -239,6 +266,7 @@ export class TokenUniverse extends EventEmitter<TokenUniverseEvents> {
     oldestTokenAge: number;
     newestTokenAge: number;
     rejectedMintsCount: number;
+    exitedMintsCount: number;
   } {
     const now = Date.now();
     let totalSwaps = 0;
@@ -257,6 +285,7 @@ export class TokenUniverse extends EventEmitter<TokenUniverseEvents> {
       oldestTokenAge: this.tokens.size > 0 ? now - oldest : 0,
       newestTokenAge: this.tokens.size > 0 ? now - newest : 0,
       rejectedMintsCount: this.rejectedMints.size,
+      exitedMintsCount: this.exitedMints.size,
     };
   }
 }
