@@ -15,6 +15,12 @@ import Decimal from 'decimal.js';
 const parsedSignatures = new Set<string>();
 const MAX_CACHE_SIZE = 5000;
 
+// Rate limiting for getParsedTransaction calls
+// Helius Free tier: 10 RPC/sec total - we use ~5/sec for parsing
+let lastParseCall = 0;
+const MIN_PARSE_INTERVAL_MS = 200; // ~5 calls/second max
+let parseQueue: Promise<any> = Promise.resolve();
+
 // wSOL mint - treat as base currency, not a token
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 
@@ -59,12 +65,42 @@ export async function parseTransactionWithHelius(
     return null;
   }
   
-  try {
-    // Get parsed transaction from Helius
-    const tx = await connection.getParsedTransaction(signature, {
-      maxSupportedTransactionVersion: 0,
+  // Rate-limited RPC call through queue
+  const tx = await new Promise<any>((resolve) => {
+    parseQueue = parseQueue.then(async () => {
+      const now = Date.now();
+      const timeSinceLastCall = now - lastParseCall;
+      if (timeSinceLastCall < MIN_PARSE_INTERVAL_MS) {
+        await new Promise(r => setTimeout(r, MIN_PARSE_INTERVAL_MS - timeSinceLastCall));
+      }
+      lastParseCall = Date.now();
+      
+      try {
+        const result = await connection.getParsedTransaction(signature, {
+          maxSupportedTransactionVersion: 0,
+        });
+        resolve(result);
+      } catch (err) {
+        // On 429, wait and retry once
+        const errMsg = (err as Error).message || '';
+        if (errMsg.includes('429')) {
+          await new Promise(r => setTimeout(r, 1000));
+          try {
+            const result = await connection.getParsedTransaction(signature, {
+              maxSupportedTransactionVersion: 0,
+            });
+            resolve(result);
+          } catch {
+            resolve(null);
+          }
+        } else {
+          resolve(null);
+        }
+      }
     });
-    
+  });
+  
+  try {
     if (!tx || !tx.meta || tx.meta.err) {
       return null;
     }
@@ -230,23 +266,23 @@ export async function parseTransactionWithHelius(
     
     // Determine DEX source from program IDs
     let dexSource = DEXSource.UNKNOWN;
-    const programIds = accountKeys.map(k => {
+    const programIds: string[] = accountKeys.map((k: any) => {
       if ('pubkey' in k) return k.pubkey.toBase58();
       if (typeof k === 'string') return k;
       return String(k);
     });
     
-    if (programIds.some(p => p.includes('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8'))) {
+    if (programIds.some((p: string) => p.includes('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8'))) {
       dexSource = DEXSource.RAYDIUM_V4;
-    } else if (programIds.some(p => p.includes('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK'))) {
+    } else if (programIds.some((p: string) => p.includes('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK'))) {
       dexSource = DEXSource.RAYDIUM_CLMM;
-    } else if (programIds.some(p => p.includes('whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc'))) {
+    } else if (programIds.some((p: string) => p.includes('whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc'))) {
       dexSource = DEXSource.ORCA_WHIRLPOOL;
-    } else if (programIds.some(p => p.includes('LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo'))) {
+    } else if (programIds.some((p: string) => p.includes('LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo'))) {
       dexSource = DEXSource.METEORA;
-    } else if (programIds.some(p => p.includes('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'))) {
+    } else if (programIds.some((p: string) => p.includes('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'))) {
       dexSource = DEXSource.PUMPFUN;
-    } else if (programIds.some(p => p.includes('pswapRwCM9XkqRitvwZwYnBMu8aHq5W4zT2oM4VaSyg'))) {
+    } else if (programIds.some((p: string) => p.includes('pswapRwCM9XkqRitvwZwYnBMu8aHq5W4zT2oM4VaSyg'))) {
       dexSource = DEXSource.PUMPSWAP;
     }
     

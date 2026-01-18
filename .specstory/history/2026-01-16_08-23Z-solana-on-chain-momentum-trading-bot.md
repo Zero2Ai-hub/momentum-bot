@@ -25480,15 +25480,30 @@ I should explain what's happening and suggest solutions like:
 
 ---
 
+This is a **rate limit error** from your Helius RPC endpoint. The bot is making too many RPC calls to verify token mints and Helius is throttling requests.
 
+The new verification logic calls `getAccountInfo()` for every token to verify it's a real mint. With high DEX volume, this creates many concurrent requests.
+
+Let me increase the rate limiting in the verifier:
 
 ---
 
 <tool-use data-tool-type="write" data-tool-name="search_replace">
 
-<details><summary>Tool use: **search_replace**</summary>
+<details><summary>Tool use: **search_replace** • Edit file: src/listener/token-verifier.ts</summary>
 
-Status: **loading**
+**Chunk 1**
+Lines added: 1, lines removed: 1
+
+```diff
+@@ -22,5 +22,5 @@
+  // Rate limiting for RPC calls
+  let lastRpcCall = 0;
+- const MIN_RPC_INTERVAL_MS = 50; // Max 20 calls/second
++ const MIN_RPC_INTERVAL_MS = 100; // Max 10 calls/second (Helius free tier limit)
+  
+  // Token Program IDs
+```
 
 </details>
 
@@ -25496,21 +25511,433 @@ Status: **loading**
 
 ---
 
-
-
----
-
-
+<think><details><summary>Thought Process</summary>
+Actually, the issue is that we're still getting too many requests. The problem is that even with rate limiting on the verifier, we have many parallel calls coming in. Let me also add exponential backoff for 429 errors.</details></think>
 
 ---
 
+<tool-use data-tool-type="write" data-tool-name="search_replace">
 
+<details><summary>Tool use: **search_replace** • Edit file: src/listener/token-verifier.ts</summary>
+
+**Chunk 1**
+Lines added: 3, lines removed: undefined
+
+```diff
+@@ -90,4 +90,7 @@
+    }
+  }
++ 
++ // Queue for serializing RPC calls to avoid 429s
++ let rpcQueue: Promise&lt;any&gt; = Promise.resolve();
+  
+  /**
+```
+
+**Chunk 2**
+Lines added: 28, lines removed: 9
+
+```diff
+@@ -111,17 +114,36 @@
+    }
+    
+-   try {
+-     // Rate limiting
+-     const now = Date.now();
+-     if (now - lastRpcCall &lt; MIN_RPC_INTERVAL_MS) {
+-       await new Promise(resolve =&gt; setTimeout(resolve, MIN_RPC_INTERVAL_MS));
+-     }
+-     lastRpcCall = Date.now();
+-     
++   // Serialize RPC calls through queue to prevent 429s
++   const result = await new Promise&lt;boolean&gt;((resolve) =&gt; {
++     rpcQueue = rpcQueue.then(async () =&gt; {
++       // Rate limiting between calls
++       const now = Date.now();
++       if (now - lastRpcCall &lt; MIN_RPC_INTERVAL_MS) {
++         await new Promise(r =&gt; setTimeout(r, MIN_RPC_INTERVAL_MS - (now - lastRpcCall)));
++       }
++       lastRpcCall = Date.now();
++       
++       try {
++         const verified = await doRpcVerification(tokenMint);
++         resolve(verified);
++       } catch {
++         resolve(false);
++       }
++     });
++   });
++   
++   return result;
++ }
++ 
++ /**
++  * Perform the actual RPC verification with retry on 429
++  */
++ async function doRpcVerification(tokenMint: string, retries = 2): Promise&lt;boolean&gt; {
++   try {
+      const pubkey = new PublicKey(tokenMint);
+      
+      // Get account info with timeout
+      const accountInfo = await Promise.race([
+-       connection.getAccountInfo(pubkey),
++       connection!.getAccountInfo(pubkey),
+        new Promise&lt;null&gt;((_, reject) =&gt; setTimeout(() =&gt; reject(new Error('timeout')), 5000))
+      ]) as Awaited&lt;ReturnType&lt;typeof connection.getAccountInfo&gt;&gt;;
+```
+
+</details>
+
+</tool-use>
 
 ---
 
-
+<think><details><summary>Thought Process</summary>
+Now I need to close the `doRpcVerification` function properly and add the retry logic for 429 errors. Let me find where the original function ended and fix it.</details></think>
 
 ---
+
+<tool-use data-tool-type="read" data-tool-name="read_file">
+<details><summary>Tool use: **read_file** • Read file: src/listener/token-verifier.ts</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+I need to see the rest of the file to properly close the function. Let me see more.</details></think>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file">
+<details><summary>Tool use: **read_file** • Read file: src/listener/token-verifier.ts</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+Good, the structure is correct now. Let me update the doRpcVerification to add retry logic for 429 errors.</details></think>
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="search_replace">
+
+<details><summary>Tool use: **search_replace** • Edit file: src/listener/token-verifier.ts</summary>
+
+**Chunk 1**
+Lines added: 10, lines removed: 2
+
+```diff
+@@ -187,8 +187,16 @@
+      
+    } catch (error) {
+-     // Invalid address or RPC error
++     const errMsg = (error as Error).message || '';
++     
++     // Retry on 429 (rate limit)
++     if (errMsg.includes('429') &amp;&amp; retries &gt; 0) {
++       log.debug('Rate limited, retrying...', { token: tokenMint.slice(0, 8), retries });
++       await new Promise(r =&gt; setTimeout(r, 500 * (3 - retries))); // Backoff: 500ms, 1000ms
++       return doRpcVerification(tokenMint, retries - 1);
++     }
++     
+      log.debug('Token verification failed', { 
+        token: tokenMint.slice(0, 16), 
+-       error: (error as Error).message 
++       error: errMsg
+      });
+      return false;
+```
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+Let me also check and fix any linting errors.</details></think>
+
+---
+
+<tool-use data-tool-type="generic" data-tool-name="read_lints">
+<details>
+          <summary>Tool use: **read_lints** • Read lints for 1 file</summary>
+      
+Lint paths:
+
+- `src/listener/token-verifier.ts`
+
+Lint results
+
+
+**No lint errors found**
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+Good. Now let me build and push.</details></think>
+
+---
+
+<tool-use data-tool-type="shell" data-tool-name="run_terminal_cmd">
+<details><summary>Tool use: **run_terminal_cmd** • Run command: npm run build 2>&1</summary>
+
+```bash
+npm run build 2>&1
+```
+
+```
+&gt; solana-momentum-bot@1.0.0 build
+&gt; tsc
+
+src/listener/token-verifier.ts:149:37 - error TS18047: 'connection' is possibly 'null'.
+
+149     ]) as Awaited&lt;ReturnType&lt;typeof connection.getAccountInfo&gt;&gt;;
+                                        ~~~~~~~~~~
+
+
+Found 1 error in src/listener/token-verifier.ts:149
+```
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+Need to fix the TypeScript error.</details></think>
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="search_replace">
+
+<details><summary>Tool use: **search_replace** • Edit file: src/listener/token-verifier.ts</summary>
+
+**Chunk 1**
+Lines added: 1, lines removed: 1
+
+```diff
+@@ -147,5 +147,5 @@
+        connection!.getAccountInfo(pubkey),
+        new Promise&lt;null&gt;((_, reject) =&gt; setTimeout(() =&gt; reject(new Error('timeout')), 5000))
+-     ]) as Awaited&lt;ReturnType&lt;typeof connection.getAccountInfo&gt;&gt;;
++     ]) as Awaited&lt;ReturnType&lt;Connection['getAccountInfo']&gt;&gt;;
+      
+      if (!accountInfo) {
+```
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+Need to import Connection type.</details></think>
+
+---
+
+<tool-use data-tool-type="shell" data-tool-name="run_terminal_cmd">
+<details><summary>Tool use: **run_terminal_cmd** • Run command: npm run build 2>&1</summary>
+
+```bash
+npm run build 2>&1
+```
+
+```
+$ npm run build 2&gt;&amp;1
+
+&gt; solana-momentum-bot@1.0.0 build
+&gt; tsc
+```
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+Build successful. Now let me commit and push.</details></think>
+
+---
+
+Build successful. Let me commit and push:
+
+---
+
+<tool-use data-tool-type="shell" data-tool-name="run_terminal_cmd">
+<details><summary>Tool use: **run_terminal_cmd** • Run command: git add -A && git commit -m "Fix 429 rate limiting: serialize RPC calls + retry with backoff" && git push</summary>
+
+```bash
+git add -A && git commit -m "Fix 429 rate limiting: serialize RPC calls + retry with backoff" && git push
+```
+
+```
+$ git add -A &amp;&amp; git commit -m "Fix 429 rate limiting: serialize RPC calls + retry with backoff" &amp;&amp; git push
+warning: LF will be replaced by CRLF in check_mint_temp.ts.
+The file will have its original line endings in your working directory
+[main d57350b] Fix 429 rate limiting: serialize RPC calls + retry with backoff
+ 3 files changed, 3316 insertions(+), 12 deletions(-)
+ create mode 100644 check_mint_temp.ts
+fatal: unable to access 'https://github.com/Zero2Ai-hub/Momentum-Bot.git/': Failed to connect to github.com port 443 after 21131 ms: Timed out
+```
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+Network timeout. The commit was successful though. Let me retry the push.</details></think>
+
+---
+
+<tool-use data-tool-type="shell" data-tool-name="run_terminal_cmd">
+<details><summary>Tool use: **run_terminal_cmd** • Run command: git push</summary>
+
+```bash
+git push
+```
+
+```
+$ git push
+Enumerating objects: 16, done.
+Counting objects: 100% (16/16), done.
+Delta compression using up to 8 threads
+Compressing objects: 100% (9/9), done.
+Writing objects: 100% (9/9), 25.36 KiB | 961.00 KiB/s, done.
+Total 9 (delta 5), reused 0 (delta 0), pack-reused 0
+remote: Resolving deltas: 100% (5/5), completed with 5 local objects.
+remote: This repository moved. Please use the new location:
+remote:   https://github.com/Zero2Ai-hub/momentum-bot.git
+To https://github.com/Zero2Ai-hub/Momentum-Bot.git
+   bb8a239..d57350b  main -&gt; main
+```
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+Done. The 429 error was a rate limit from Helius RPC. I've:
+1. Increased the minimum interval between calls from 50ms to 100ms
+2. Serialized all RPC calls through a queue (no parallel calls)
+3. Added retry with exponential backoff for 429 errors</details></think>
+
+---
+
+Fixed and pushed!
+
+**What was happening:**
+The `429 Too Many Requests` error means Helius RPC was rate limiting the bot. The new mint verification makes an RPC call for each token, and with high DEX volume, this exceeded the rate limit.
+
+**What I fixed:**
+1. **Serialized RPC calls** - No more parallel verification requests, all go through a queue
+2. **Increased delay** - 100ms minimum between calls (10/sec instead of 20/sec)  
+3. **Retry with backoff** - On 429, waits 500ms → 1000ms and retries
+
+The bot should now handle rate limits gracefully. You may need to restart it if it's running.
+
+---
+
+_**User (2026-01-18 07:41Z)**_
+
+now check the logs and tell me what you found
+
+---
+
+_**Agent (model claude-4.5-opus-high-thinking, mode Agent)**_
+
+<think><details><summary>Thought Process</summary>
+The user wants me to check the logs to see what's happening with the bot. Let me read the bot.log and events log files to see if the fixes are working and what tokens are being detected.</details></think>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file">
+<details><summary>Tool use: **read_file** • Read file: logs/bot.log</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="shell" data-tool-name="run_terminal_cmd">
+<details><summary>Tool use: **run_terminal_cmd** • Run command: tail -100 logs/events_2026-01-18.jsonl 2>/dev/null | head -50</summary>
+
+```bash
+tail -100 logs/events_2026-01-18.jsonl 2>/dev/null | head -50
+```
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file">
+<details><summary>Tool use: **read_file** • Read file: c:\Users\Aladdin\.cursor\projects\d-ZeroToAI-MVPs-Momentum-Trading-Bot\agent-tools\83fa4818-58c1-4b6a-9c51-29da40896911.txt</summary>
+
+</details>
+</tool-use>
+
+---
+
+## 📊 Log Analysis - GREAT NEWS!
+
+The fixes are **working correctly**! Here's what I found:
+
+### ✅ Real Tokens Being Detected
+
+| Token Mint | DEX | Activity |
+|------------|-----|----------|
+| `MEFNBXixkEbait3xn9bkm8WsJzXtVsaJEn4c8Sam21u` | Raydium CLMM | Multiple SELLs (~0.001 SOL each) |
+| `472Lf8YX7Cd921vDCeQRwnQkMek1nvFZmKqPUfbKpump` | **Pump.fun** | BUYs/SELLs (0.01-2 SOL) |
+| `EEcaRX5n4GSHbsquf7vGtsXhn6wSZkgBvYDjFwyBPhrr` | Raydium CLMM | Heavy trading (2-4 SOL swaps) |
+| `3o9ggNdoF25GS8sk18swvRgqFuNMPHB3aTX29La58qPf` | Raydium CLMM | Active trading |
+
+### ✅ Momentum Signals Working
+
+```
+🔥 MOMENTUM: MEFNBXixkEba... | 80% of threshold | swaps=22 | buyers=1 | net=2.087 SOL
+🔥 MOMENTUM: EEcaRX5n4GSH... | 63% of threshold | swaps=9 | buyers=5 | net=3.824 SOL
+```
+
+### ✅ Bot Status Healthy
+
+- **Swaps/min**: 108-151 (good throughput)
+- **Active tokens**: 4-6 (real tokens, not garbage!)
+- **No phantom tokens** - all mints are verified SPL tokens
+
+### ⚠️ 429 Rate Limits
+
+The rate limiting is still happening (from your terminal selection). The serialization fix I pushed should help, but you may need to **restart the bot** to pick up the new code with the queue-based rate limiting.
+
+**To restart:**
+```bash
+# Stop the bot (Ctrl+C)
+# Then restart
+npm start
+```
+
+The bot is now correctly:
+1. ✅ Detecting real token mints (not program IDs)
+2. ✅ Processing Pump.fun tokens (Token-2022)
+3. ✅ Computing proper direction (BUY/SELL)
+4. ✅ Reasonable notional values (0.001 - 4 SOL range)
+5. ✅ Multiple DEXes working (Raydium CLMM, Pump.fun)
+
+---
+
+_**User (2026-01-18 07:41Z)**_
+
+i restarted the bot and i am still getting the error
+Here is the helius rate limits (I am on free plan): https://www.helius.dev/docs/billing/rate-limits 
+2. I need the token addresses to not be truncated to be able to check it
+
+---
+
+_**Agent (model claude-4.5-opus-high-thinking, mode Agent)**_
 
 
 

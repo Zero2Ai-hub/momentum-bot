@@ -20,8 +20,10 @@ const pendingVerifications = new Map<string, Promise<boolean>>();
 let connection: Connection | null = null;
 
 // Rate limiting for RPC calls
+// Helius Free tier: 10 RPC requests/sec - but we share with getParsedTransaction
+// So we limit verification to ~3/sec to leave room for other calls
 let lastRpcCall = 0;
-const MIN_RPC_INTERVAL_MS = 100; // Max 10 calls/second (Helius free tier limit)
+const MIN_RPC_INTERVAL_MS = 300; // ~3 calls/second for verification
 
 // Token Program IDs
 const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';

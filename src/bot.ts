@@ -246,7 +246,8 @@ export class MomentumBot extends EventEmitter<BotEvents> {
     const analytics60s = tokenState.getWindowMetrics('60s');
     if (score.totalScore >= this.config.entryThreshold * 0.5) {
       const pct = ((score.totalScore / this.config.entryThreshold) * 100).toFixed(0);
-      log.info(`🔥 MOMENTUM: ${tokenState.tokenMint.slice(0, 12)}... | ${pct}% of threshold | swaps=${analytics60s.swapCount} | buyers=${analytics60s.uniqueBuyers.size} | net=${analytics60s.netInflow.toFixed(3)} SOL`);
+      // Full token mint for easy lookup on Solscan/Birdeye
+      log.info(`🔥 MOMENTUM: ${tokenState.tokenMint} | ${pct}% | swaps=${analytics60s.swapCount} | buyers=${analytics60s.uniqueBuyers.size} | net=${analytics60s.netInflow.toFixed(3)} SOL`);
     }
     
     // Check if entry is ready
