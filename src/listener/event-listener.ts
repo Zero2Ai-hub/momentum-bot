@@ -262,7 +262,7 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
         continue;
       }
       
-      // Record in hot token tracker
+      // Record in hot token tracker (tracks signatures for later parsing)
       this.hotTokenTracker.recordSwap(
         candidate.candidateAddress,
         logs.signature,
@@ -270,10 +270,13 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
         candidate.wallet
       );
       
-      // Buffer ALL pump token events for emission after verification
-      // Whether from PUMPFUN/PUMPSWAP or other DEXs (METEORA, RAYDIUM, etc.)
-      // All tokens ending with "pump" are pump.fun tokens!
-      this.bufferPumpEvent(candidate);
+      // ONLY buffer events from PUMPFUN/PUMPSWAP sources - they have REAL data!
+      // For non-pump sources (METEORA, RAYDIUM, ORCA), we only track signatures.
+      // Real data will be fetched via getParsedTransaction after Phase 2 verification.
+      if (candidate.isPumpSource) {
+        this.bufferPumpEvent(candidate);
+      }
+      // Non-pump sources: signatures tracked above, will be parsed in Phase 2
     }
   }
   
@@ -531,14 +534,15 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
   }
   
   /**
-   * P0-4: Verify pump candidate - NO getParsedTransaction calls
-   * Just verify the mint once with getAccountInfo
+   * Verify pump candidate
+   * - For PUMPFUN/PUMPSWAP: flush buffered events (already have real data)
+   * - For non-pump sources: parse signatures to get REAL wallet/direction/notional
    */
   private async verifyPumpCandidate(candidate: string, stats: HotDetectionStats): Promise<void> {
     // Check cache first
     if (this.verifiedMints.has(candidate)) {
       log.info(`✅ Phase 2 VERIFIED (cached): ${candidate}`);
-      this.flushPendingPumpEvents(candidate);
+      await this.emitRealEventsForCandidate(candidate);
       this.hotTokenTracker.setCooldown(candidate, 'success');
       return;
     }
@@ -556,15 +560,18 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     if (isValid) {
       log.info(`✅ Phase 2 VERIFIED (pump fast path): ${candidate}`);
       
+      this.verifiedMints.add(candidate);
+      
+      // Emit real events (either from buffer or by parsing signatures)
+      const txParseCalls = await this.emitRealEventsForCandidate(candidate);
+      
       logEvent(LogEventType.PHASE2_VERIFIED, {
         candidate,
-        method: 'pump_fast_path',
-        txParseCalls: 0,
+        method: txParseCalls > 0 ? 'with_tx_parse' : 'pump_fast_path',
+        txParseCalls,
         accountInfoCalls: 1,
       });
       
-      this.verifiedMints.add(candidate);
-      this.flushPendingPumpEvents(candidate);
       this.hotTokenTracker.setCooldown(candidate, 'success');
     } else {
       log.info(`❌ Phase 2 REJECTED (pump fast path): ${candidate} - not a valid SPL mint`);
@@ -578,6 +585,75 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
       this.pendingPumpEvents.delete(candidate);
       this.hotTokenTracker.setCooldown(candidate, 'rejected');
     }
+  }
+  
+  /**
+   * Emit real events for a verified candidate
+   * - If we have buffered events (from PUMPFUN/PUMPSWAP), flush them
+   * - If no buffered events (from non-pump DEX), parse signatures to get REAL data
+   * Returns number of tx parse calls made
+   */
+  private async emitRealEventsForCandidate(candidate: string): Promise<number> {
+    // Check if we have buffered events (from PUMPFUN/PUMPSWAP - already real data)
+    const bufferedEvents = this.pendingPumpEvents.get(candidate);
+    
+    if (bufferedEvents && bufferedEvents.length > 0) {
+      // Flush buffered events - they already have real wallet/direction/notional
+      this.flushPendingPumpEvents(candidate);
+      return 0; // No tx parsing needed
+    }
+    
+    // No buffered events = came from non-pump DEX (METEORA, RAYDIUM, ORCA)
+    // Parse 1-3 signatures to get REAL wallet/direction/notional
+    const signatures = this.hotTokenTracker.getRecentSignatures(candidate, 3);
+    
+    if (signatures.length === 0) {
+      log.debug(`No signatures to parse for ${candidate.slice(0, 16)}...`);
+      return 0;
+    }
+    
+    log.info(`📊 Parsing ${signatures.length} signatures for REAL data: ${candidate.slice(0, 16)}...`);
+    
+    let txParseCalls = 0;
+    let eventsEmitted = 0;
+    
+    for (const sig of signatures) {
+      try {
+        const event = await parseTransactionWithHelius(this.connection!, sig, 0);
+        txParseCalls++;
+        this.rpcCounters.getParsedTransaction++;
+        
+        // Only emit if this event is for our candidate token
+        if (event && event.tokenMint === candidate) {
+          const validation = validateSwapEvent(
+            event.tokenMint,
+            event.walletAddress,
+            event.notionalSol.toNumber()
+          );
+          
+          if (validation.valid) {
+            logEvent(LogEventType.SWAP_DETECTED, {
+              signature: event.signature,
+              tokenMint: event.tokenMint,
+              direction: event.direction,
+              notionalSol: event.notionalSol.toString(),
+              wallet: event.walletAddress,
+              dex: event.dexSource,
+              phase: 'non_pump_tx_parsed',
+            });
+            
+            this.emit('swap', event);
+            eventsEmitted++;
+          }
+        }
+      } catch (error) {
+        log.debug(`Failed to parse signature ${sig.slice(0, 16)}...`);
+      }
+    }
+    
+    log.info(`✅ Emitted ${eventsEmitted} REAL events for ${candidate.slice(0, 16)}... (${txParseCalls} tx parses)`);
+    
+    return txParseCalls;
   }
   
   /**
