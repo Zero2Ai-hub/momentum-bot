@@ -156,16 +156,78 @@ function isBinaryGarbage(address: string): boolean {
 }
 
 // Prefixes that indicate pool/AMM/protocol addresses, NOT tokens
+// These are CASE-SENSITIVE matched first, then lowercase matched
 const NON_TOKEN_PREFIXES = [
+  // AMM/Pool prefixes
   'pAMM',    // AMM pool addresses
   'pool',    // Pool addresses
   'vault',   // Vault addresses
+  'swap',    // Swap program accounts
+  'Swap',
+  
+  // DEX-specific
   'orca',    // Orca pool accounts
   'whirl',   // Whirlpool accounts
   'clmm',    // CLMM pool accounts
   'raydium', // Raydium accounts
   'meteora', // Meteora accounts
+  'pump',    // Pump.fun infrastructure
+  'Pump',
+  'pswap',   // PumpSwap
+  
+  // Infrastructure prefixes that appear in logs
+  'SoL',     // SOL-related addresses (note: case-sensitive)
+  'Sol',     // SOL variants
+  'SOL',     // SOL all caps
+  'mine',    // Mining/miner addresses
+  'Mine',
+  'MINE',
+  
+  // Protocol prefixes (these look like tokens but are protocol accounts)
+  'ALPHA',   // ALPHA protocol accounts
+  'TITAN',   // TITAN protocol
+  'T1TAN',   // TITAN variant
+  'BETA',    // BETA protocol
+  'GAMA',    // GAMA protocol
+  'DELTA',   // DELTA protocol
+  'ZERO',    // ZERO protocol
+  'ZER0',    // ZERO variant
+  
+  // Validator/staking prefixes
+  'stake',   // Staking accounts
+  'Stake',
+  'valid',   // Validator accounts
+  'Valid',
+  
+  // Fee/authority prefixes
+  'fee',     // Fee accounts
+  'Fee',
+  'auth',    // Authority accounts
+  'Auth',
+  'pro',     // Protocol accounts (like proVF4p...)
+  'Pro',
+  
+  // Other infrastructure
+  'cfg',     // Config accounts
+  'Cfg',
+  'sys',     // System accounts
+  'Sys',
+  'SYS',
+  'pda',     // PDA accounts
+  'PDA',
 ];
+
+// Known non-token addresses that bypass prefix check
+// These are specific addresses that appear frequently as false positives
+const KNOWN_NON_TOKENS = new Set([
+  // Known pool/infrastructure addresses from logs
+  'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH',  // Appears frequently
+  'SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF',   // PumpSwap pool authority
+  'FE7fSucz1kaEY6maPhx3xLnqfniRiAVoZmgkfAUhGNF5',  // Infrastructure
+  'FJZ1Hc6LkqfpaoRttNqyBAV5YkMcbAXeffHcg2UFbsNz',  // Infrastructure
+  'HomwFqVpHxManrjiV6gGty6Dz5gu1TUFnazJv3F1iWjk', // Infrastructure
+  'ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA', // ALPHA protocol
+]);
 
 /**
  * Check if an address looks like a valid token mint
@@ -183,6 +245,11 @@ export function isValidTokenMint(address: string): boolean {
     return false;
   }
   
+  // Check against known non-token addresses
+  if (KNOWN_NON_TOKENS.has(address)) {
+    return false;
+  }
+  
   // Must not be a system/infrastructure address
   if (isSystemAddress(address)) {
     return false;
@@ -194,6 +261,14 @@ export function isValidTokenMint(address: string): boolean {
   }
   
   // Must not start with known non-token prefixes (pools, vaults, etc.)
+  // First check case-sensitive prefixes
+  for (const prefix of NON_TOKEN_PREFIXES) {
+    if (address.startsWith(prefix)) {
+      return false;
+    }
+  }
+  
+  // Also check lowercase version for safety
   const lowerAddr = address.toLowerCase();
   for (const prefix of NON_TOKEN_PREFIXES) {
     if (lowerAddr.startsWith(prefix.toLowerCase())) {
