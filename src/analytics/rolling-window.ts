@@ -54,14 +54,21 @@ export class RollingWindow {
       this._buyCount++;
       this._buyNotional = this._buyNotional.plus(event.notionalSol);
       
-      const existing = this._uniqueBuyers.get(event.walletAddress) || new Decimal(0);
-      this._uniqueBuyers.set(event.walletAddress, existing.plus(event.notionalSol));
+      // FIX: Don't count 'unknown' wallets as unique buyers
+      // Phase 1 events have placeholder wallets - counting them inflates buyer count artificially
+      if (event.walletAddress !== 'unknown') {
+        const existing = this._uniqueBuyers.get(event.walletAddress) || new Decimal(0);
+        this._uniqueBuyers.set(event.walletAddress, existing.plus(event.notionalSol));
+      }
     } else {
       this._sellCount++;
       this._sellNotional = this._sellNotional.plus(event.notionalSol);
       
-      const existing = this._uniqueSellers.get(event.walletAddress) || new Decimal(0);
-      this._uniqueSellers.set(event.walletAddress, existing.plus(event.notionalSol));
+      // FIX: Don't count 'unknown' wallets as unique sellers
+      if (event.walletAddress !== 'unknown') {
+        const existing = this._uniqueSellers.get(event.walletAddress) || new Decimal(0);
+        this._uniqueSellers.set(event.walletAddress, existing.plus(event.notionalSol));
+      }
     }
     
     // Track prices for price change calculation
@@ -104,26 +111,32 @@ export class RollingWindow {
       this._buyCount--;
       this._buyNotional = this._buyNotional.minus(event.notionalSol);
       
-      const existing = this._uniqueBuyers.get(event.walletAddress);
-      if (existing) {
-        const newVal = existing.minus(event.notionalSol);
-        if (newVal.lte(0)) {
-          this._uniqueBuyers.delete(event.walletAddress);
-        } else {
-          this._uniqueBuyers.set(event.walletAddress, newVal);
+      // FIX: Match the add logic - don't touch unknown wallets
+      if (event.walletAddress !== 'unknown') {
+        const existing = this._uniqueBuyers.get(event.walletAddress);
+        if (existing) {
+          const newVal = existing.minus(event.notionalSol);
+          if (newVal.lte(0)) {
+            this._uniqueBuyers.delete(event.walletAddress);
+          } else {
+            this._uniqueBuyers.set(event.walletAddress, newVal);
+          }
         }
       }
     } else {
       this._sellCount--;
       this._sellNotional = this._sellNotional.minus(event.notionalSol);
       
-      const existing = this._uniqueSellers.get(event.walletAddress);
-      if (existing) {
-        const newVal = existing.minus(event.notionalSol);
-        if (newVal.lte(0)) {
-          this._uniqueSellers.delete(event.walletAddress);
-        } else {
-          this._uniqueSellers.set(event.walletAddress, newVal);
+      // FIX: Match the add logic - don't touch unknown wallets
+      if (event.walletAddress !== 'unknown') {
+        const existing = this._uniqueSellers.get(event.walletAddress);
+        if (existing) {
+          const newVal = existing.minus(event.notionalSol);
+          if (newVal.lte(0)) {
+            this._uniqueSellers.delete(event.walletAddress);
+          } else {
+            this._uniqueSellers.set(event.walletAddress, newVal);
+          }
         }
       }
     }

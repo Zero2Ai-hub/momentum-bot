@@ -3,11 +3,12 @@
  * Manages lifecycle of token state objects with automatic expiry.
  * 
  * FIX: Added mint validation as second safety net before universe entry.
+ * ENHANCED: Now accepts Phase 1 hotness stats for data-budget-aware scoring.
  */
 
 import EventEmitter from 'eventemitter3';
 import { SwapEvent, LogEventType } from '../types';
-import { TokenState } from './token-state';
+import { TokenState, Phase1HotnessStats } from './token-state';
 import { getConfig } from '../config/config';
 import { logEvent, log } from '../logging/logger';
 import { isVerifiedToken, isValidTradeableToken } from '../listener/token-verifier';
@@ -32,6 +33,9 @@ export class TokenUniverse extends EventEmitter<TokenUniverseEvents> {
   
   // P1-7: Track mints that have exited to prevent duplicate exit events
   private exitedMints = new Set<string>();
+  
+  // Cache of pending Phase 1 stats (attached when token enters universe)
+  private pendingPhase1Stats = new Map<string, Phase1HotnessStats>();
   
   constructor() {
     super();
@@ -84,18 +88,24 @@ export class TokenUniverse extends EventEmitter<TokenUniverseEvents> {
       // First check sync cache
       const cachedResult = isVerifiedToken(tokenMint);
       
+      // Log cache result for pump tokens
+      if (tokenMint.endsWith('pump')) {
+        log.info(`🔍 Universe cache check: ${tokenMint.slice(0, 20)}... result=${cachedResult}`);
+      }
+      
       if (cachedResult === false) {
         this.rejectedMints.add(tokenMint);
-        log.debug('Universe rejected non-mint (cached)', { mint: tokenMint.slice(0, 16) });
         return null;
       }
       
       // If not in cache, do async verification
       if (cachedResult === undefined) {
+        log.info(`⏳ Universe verifying NEW token: ${tokenMint.slice(0, 20)}...`);
+        
         const isValid = await isValidTradeableToken(tokenMint);
         if (!isValid) {
           this.rejectedMints.add(tokenMint);
-          log.debug('Universe rejected non-mint (verified)', { mint: tokenMint.slice(0, 16) });
+          log.info(`❌ Universe REJECTED: ${tokenMint.slice(0, 20)}... (not valid SPL mint)`);
           return null;
         }
       }
@@ -106,6 +116,16 @@ export class TokenUniverse extends EventEmitter<TokenUniverseEvents> {
       
       // P1-7: Clear exit flag for re-entry (clean lifecycle)
       this.exitedMints.delete(tokenMint);
+      
+      // FIX: Attach pending Phase 1 stats if available (they were cached before token entered)
+      const pendingStats = this.pendingPhase1Stats.get(tokenMint);
+      if (pendingStats) {
+        state.setPhase1Stats(pendingStats);
+        this.pendingPhase1Stats.delete(tokenMint);
+        log.info(`✅ Token ENTERED universe: ${tokenMint.slice(0, 20)}... WITH PHASE 1 STATS: swaps=${pendingStats.swapsInWindow}`);
+      } else {
+        log.info(`✅ Token ENTERED universe: ${tokenMint.slice(0, 20)}... (no Phase 1 stats)`);
+      }
       
       this.emit('token:entered', tokenMint, state);
     } else {
@@ -170,6 +190,24 @@ export class TokenUniverse extends EventEmitter<TokenUniverseEvents> {
    */
   getToken(tokenMint: string): TokenState | undefined {
     return this.tokens.get(tokenMint);
+  }
+  
+  /**
+   * Set Phase 1 hotness stats on a token (for data-budget-aware scoring)
+   * Call this when a token transitions to "hot" in Phase 1
+   * 
+   * FIX: If token isn't in universe yet, cache the stats for later attachment
+   */
+  setPhase1Stats(tokenMint: string, stats: Phase1HotnessStats): void {
+    const state = this.tokens.get(tokenMint);
+    if (state) {
+      state.setPhase1Stats(stats);
+      log.info(`📊 Phase 1 stats ATTACHED: ${tokenMint.slice(0, 20)}... swaps=${stats.swapsInWindow} buyRatio=${(stats.buyRatio * 100).toFixed(0)}%`);
+    } else {
+      // Token not in universe yet - cache for later attachment
+      this.pendingPhase1Stats.set(tokenMint, stats);
+      log.info(`📊 Phase 1 stats CACHED: ${tokenMint.slice(0, 20)}... swaps=${stats.swapsInWindow} (token not in universe yet)`);
+    }
   }
   
   /**

@@ -1,11 +1,29 @@
 /**
  * Per-token state management.
  * Maintains rolling windows and metrics for a single token.
+ * 
+ * ENHANCED: Now stores Phase 1 hotness stats for data-budget-aware scoring.
+ * Phase 1 has MORE accurate swap counts than Phase 2 (which only has partial data).
  */
 
 import Decimal from 'decimal.js';
 import { SwapEvent, TokenMetrics, WindowMetrics, WindowSize, WINDOW_SIZES } from '../types';
 import { RollingWindow, createWindowSet } from '../analytics/rolling-window';
+
+/**
+ * Phase 1 hotness statistics - passed from HotTokenTracker
+ * These represent the REAL on-chain activity (from log parsing)
+ */
+export interface Phase1HotnessStats {
+  swapsInWindow: number;      // Actual swap count (more accurate than Phase 2!)
+  buys: number;               // Buy count from log inference
+  sells: number;              // Sell count from log inference
+  buyRatio: number;           // buys / total
+  windowMs: number;           // Time window the stats cover
+  detectedAt: number;         // Timestamp when hotness was detected
+  baselineSwapsPerMin: number;// Pre-momentum activity level
+  isNewMomentum: boolean;     // Was this a quiet→hot transition?
+}
 
 export class TokenState {
   readonly tokenMint: string;
@@ -26,6 +44,9 @@ export class TokenState {
   private _consecutiveAboveEntryMs = 0;
   private _lastScoreCheckTimestamp = 0;
   private _consecutiveNegativeInflowMs = 0;
+  
+  // Phase 1 hotness data (more accurate than Phase 2's sparse events)
+  private _phase1Stats: Phase1HotnessStats | null = null;
   
   constructor(tokenMint: string, firstEvent: SwapEvent) {
     this.tokenMint = tokenMint;
@@ -164,7 +185,62 @@ export class TokenState {
     this._lastScoreCheckTimestamp = Date.now();
   }
   
+  // ═══════════════════════════════════════════════════════════════
+  // Phase 1 Integration (Data-Budget Aware Scoring)
+  // ═══════════════════════════════════════════════════════════════
+  
+  /**
+   * Set Phase 1 hotness stats (called when token becomes "hot")
+   * These stats are MORE accurate than Phase 2 data because they capture
+   * ALL on-chain swaps, not just the subset we could parse via RPC.
+   */
+  setPhase1Stats(stats: Phase1HotnessStats): void {
+    this._phase1Stats = stats;
+  }
+  
+  /**
+   * Get Phase 1 hotness stats
+   */
+  get phase1Stats(): Phase1HotnessStats | null {
+    return this._phase1Stats;
+  }
+  
+  /**
+   * Check if we have Phase 1 data
+   */
+  get hasPhase1Data(): boolean {
+    return this._phase1Stats !== null;
+  }
+  
+  /**
+   * Get effective swap count for scoring
+   * Uses Phase 1 data if available (more accurate), falls back to Phase 2
+   */
+  getEffectiveSwapCount(windowSize: WindowSize): number {
+    // Phase 1 stats cover ~30s window, which maps to 15s/60s windows
+    if (this._phase1Stats && (windowSize === '15s' || windowSize === '60s')) {
+      return this._phase1Stats.swapsInWindow;
+    }
+    return this.windows[windowSize].getMetrics().swapCount;
+  }
+  
+  /**
+   * Get effective buy ratio for scoring
+   * Uses Phase 1 data if available (more accurate), falls back to Phase 2
+   */
+  getEffectiveBuyRatio(): number {
+    if (this._phase1Stats) {
+      return this._phase1Stats.buyRatio;
+    }
+    const metrics = this.windows['60s'].getMetrics();
+    const total = metrics.buyCount + metrics.sellCount;
+    return total > 0 ? metrics.buyCount / total : 0.5;
+  }
+  
+  // ═══════════════════════════════════════════════════════════════
   // Getters
+  // ═══════════════════════════════════════════════════════════════
+  
   get allTimeSwapCount(): number {
     return this._allTimeSwapCount;
   }

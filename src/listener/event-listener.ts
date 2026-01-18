@@ -26,6 +26,7 @@ import { getHotTokenTracker, HotTokenTracker, HotDetectionStats } from './hot-to
 import { parseRaydiumSwap } from './parsers/raydium';
 import { parsePumpFunSwap } from './parsers/pumpfun';
 import { parsePumpSwapLogs } from './parsers/pumpswap';
+import { getTokenUniverse } from '../universe/token-universe';
 
 // ═══════════════════════════════════════════════════════════════════
 // Types
@@ -666,12 +667,16 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
    * Verify pump candidate
    * - For PUMPFUN/PUMPSWAP: flush buffered events (already have real data)
    * - For non-pump sources: parse signatures to get REAL wallet/direction/notional
+   * 
+   * ENHANCED: Now passes Phase 1 hotness stats to TokenUniverse for data-budget-aware scoring
    */
   private async verifyPumpCandidate(candidate: string, stats: HotDetectionStats): Promise<void> {
     // Check cache first
     if (this.verifiedMints.has(candidate)) {
       log.info(`✅ Phase 2 VERIFIED (cached): ${candidate}`);
       await this.emitRealEventsForCandidate(candidate);
+      // Attach Phase 1 stats to existing token (if in universe)
+      this.attachPhase1Stats(candidate, stats);
       this.hotTokenTracker.setCooldown(candidate, 'success');
       return;
     }
@@ -691,6 +696,10 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
       
       this.verifiedMints.add(candidate);
       
+      // FIX: Cache Phase 1 stats FIRST (before events can create the token)
+      // This ensures stats are attached when token enters universe
+      this.attachPhase1Stats(candidate, stats);
+      
       // Emit real events (either from buffer or by parsing signatures)
       const txParseCalls = await this.emitRealEventsForCandidate(candidate);
       
@@ -699,6 +708,8 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
         method: txParseCalls > 0 ? 'with_tx_parse' : 'pump_fast_path',
         txParseCalls,
         accountInfoCalls: 1,
+        phase1SwapsInWindow: stats.swapsInWindow,
+        phase1BuyRatio: stats.buyRatio,
       });
       
       this.hotTokenTracker.setCooldown(candidate, 'success');
@@ -714,6 +725,28 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
       this.pendingPumpEvents.delete(candidate);
       this.hotTokenTracker.setCooldown(candidate, 'rejected');
     }
+  }
+  
+  /**
+   * Attach Phase 1 hotness stats to a token in the universe
+   * This enables data-budget-aware scoring that uses the MORE ACCURATE Phase 1 swap count
+   */
+  private attachPhase1Stats(tokenMint: string, stats: HotDetectionStats): void {
+    const universe = getTokenUniverse();
+    
+    // Convert HotDetectionStats to Phase1HotnessStats
+    const phase1Stats = {
+      swapsInWindow: stats.swapsInWindow,
+      buys: stats.buys,
+      sells: stats.sells,
+      buyRatio: stats.buyRatio,
+      windowMs: stats.windowActualMs,
+      detectedAt: Date.now(),
+      baselineSwapsPerMin: stats.baselineSwapsPerMin,
+      isNewMomentum: stats.isNewMomentum,
+    };
+    
+    universe.setPhase1Stats(tokenMint, phase1Stats);
   }
   
   /**
