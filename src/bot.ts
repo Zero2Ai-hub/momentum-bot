@@ -226,8 +226,13 @@ export class MomentumBot extends EventEmitter<BotEvents> {
   private async handleSwapEvent(event: SwapEvent): Promise<void> {
     this.swapsProcessed++;
     
-    // Update token universe
-    const tokenState = this.tokenUniverse!.processSwap(event);
+    // Update token universe (now validates mint as second safety net)
+    const tokenState = await this.tokenUniverse!.processSwap(event);
+    
+    // Skip if token was rejected (null means invalid mint or validation failed)
+    if (!tokenState) {
+      return;
+    }
     
     // Skip if we already have a position in this token
     if (this.positionManager!.hasPositionInToken(event.tokenMint)) {

@@ -187,8 +187,13 @@ export class ReplayHarness {
    * Process a swap event through the signal engine
    */
   private async processSwapEvent(event: SwapEvent): Promise<void> {
-    // Update token universe
-    const tokenState = this.universe.processSwap(event);
+    // Update token universe (validates mint)
+    const tokenState = await this.universe.processSwap(event);
+    
+    // Skip if token was rejected
+    if (!tokenState) {
+      return;
+    }
     
     // Calculate momentum score
     const score = this.scorer.calculateScore(tokenState);

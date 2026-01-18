@@ -8,6 +8,7 @@
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
     "replay": "ts-node src/replay/replay-harness.ts",
+    "validate:tx": "ts-node src/test/validate-tx.ts",
     "lint": "eslint src/**/*.ts",
     "test": "jest"
   },

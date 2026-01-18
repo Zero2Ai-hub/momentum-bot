@@ -1,6 +1,8 @@
 /**
  * Token Universe - In-memory registry of active tokens.
  * Manages lifecycle of token state objects with automatic expiry.
+ * 
+ * FIX: Added mint validation as second safety net before universe entry.
  */
 
 import EventEmitter from 'eventemitter3';
@@ -8,6 +10,7 @@ import { SwapEvent, LogEventType } from '../types';
 import { TokenState } from './token-state';
 import { getConfig } from '../config/config';
 import { logEvent, log } from '../logging/logger';
+import { isVerifiedToken, isValidTradeableToken } from '../listener/token-verifier';
 
 interface TokenUniverseEvents {
   'token:entered': (tokenMint: string, state: TokenState) => void;
@@ -23,6 +26,9 @@ export class TokenUniverse extends EventEmitter<TokenUniverseEvents> {
   private tokens = new Map<string, TokenState>();
   private cleanupInterval: NodeJS.Timeout | null = null;
   private inactivityTimeoutMs: number;
+  
+  // Set of mints that failed verification (don't re-verify)
+  private rejectedMints = new Set<string>();
   
   constructor() {
     super();
@@ -50,23 +56,101 @@ export class TokenUniverse extends EventEmitter<TokenUniverseEvents> {
   
   /**
    * Process a swap event - creates or updates token state
+   * 
+   * FIX (P0): Validates mint before allowing entry into universe.
+   * This is a second safety net in case upstream emits an invalid mint.
    */
-  processSwap(event: SwapEvent): TokenState {
-    let state = this.tokens.get(event.tokenMint);
+  async processSwap(event: SwapEvent): Promise<TokenState | null> {
+    const { tokenMint } = event;
+    
+    // ═══════════════════════════════════════════════════════════════
+    // FIX: VALIDATE MINT BEFORE UNIVERSE ENTRY
+    // ═══════════════════════════════════════════════════════════════
+    
+    // Fast rejection for previously rejected mints
+    if (this.rejectedMints.has(tokenMint)) {
+      return null;
+    }
+    
+    // Check if token is already in universe (already validated)
+    let state = this.tokens.get(tokenMint);
     
     if (!state) {
-      // New token - create state (no console logging - too verbose)
-      state = new TokenState(event.tokenMint, event);
-      this.tokens.set(event.tokenMint, state);
-      this.emit('token:entered', event.tokenMint, state);
+      // NEW TOKEN: Must validate before entry
+      
+      // First check sync cache
+      const cachedResult = isVerifiedToken(tokenMint);
+      
+      if (cachedResult === false) {
+        this.rejectedMints.add(tokenMint);
+        log.debug('Universe rejected non-mint (cached)', { mint: tokenMint.slice(0, 16) });
+        return null;
+      }
+      
+      // If not in cache, do async verification
+      if (cachedResult === undefined) {
+        const isValid = await isValidTradeableToken(tokenMint);
+        if (!isValid) {
+          this.rejectedMints.add(tokenMint);
+          log.debug('Universe rejected non-mint (verified)', { mint: tokenMint.slice(0, 16) });
+          return null;
+        }
+      }
+      
+      // VALIDATED: Create new token state
+      state = new TokenState(tokenMint, event);
+      this.tokens.set(tokenMint, state);
+      this.emit('token:entered', tokenMint, state);
     } else {
       // Existing token - update state
       state.processSwap(event);
     }
     
     // Emit swap event for scoring engine
-    this.emit('token:swap', event.tokenMint, event, state);
+    this.emit('token:swap', tokenMint, event, state);
     
+    return state;
+  }
+  
+  /**
+   * Synchronous process swap - for backwards compatibility
+   * Only processes if token is already verified in cache
+   */
+  processSwapSync(event: SwapEvent): TokenState | null {
+    const { tokenMint } = event;
+    
+    // Fast rejection
+    if (this.rejectedMints.has(tokenMint)) {
+      return null;
+    }
+    
+    // Check if already in universe
+    let state = this.tokens.get(tokenMint);
+    
+    if (!state) {
+      // Check sync cache only
+      const cachedResult = isVerifiedToken(tokenMint);
+      
+      if (cachedResult === false) {
+        this.rejectedMints.add(tokenMint);
+        return null;
+      }
+      
+      if (cachedResult !== true) {
+        // Not verified yet - don't allow entry synchronously
+        // The async version should be used instead
+        return null;
+      }
+      
+      // Verified: Create new token state
+      state = new TokenState(tokenMint, event);
+      this.tokens.set(tokenMint, state);
+      this.emit('token:entered', tokenMint, state);
+    } else {
+      state.processSwap(event);
+    }
+    
+    this.emit('token:swap', tokenMint, event, state);
     return state;
   }
   
@@ -129,7 +213,6 @@ export class TokenUniverse extends EventEmitter<TokenUniverseEvents> {
     for (const mint of toRemove) {
       const state = this.tokens.get(mint)!;
       
-      // Only log to events file, not console
       logEvent(LogEventType.TOKEN_EXITED_UNIVERSE, {
         tokenMint: mint,
         totalSwaps: state.allTimeSwapCount,
@@ -138,6 +221,12 @@ export class TokenUniverse extends EventEmitter<TokenUniverseEvents> {
       
       this.tokens.delete(mint);
       this.emit('token:exited', mint);
+    }
+    
+    // Cleanup rejected mints periodically (keep last 10000)
+    if (this.rejectedMints.size > 10000) {
+      const arr = Array.from(this.rejectedMints);
+      this.rejectedMints = new Set(arr.slice(-5000));
     }
   }
   
@@ -149,6 +238,7 @@ export class TokenUniverse extends EventEmitter<TokenUniverseEvents> {
     totalSwapsTracked: number;
     oldestTokenAge: number;
     newestTokenAge: number;
+    rejectedMintsCount: number;
   } {
     const now = Date.now();
     let totalSwaps = 0;
@@ -166,6 +256,7 @@ export class TokenUniverse extends EventEmitter<TokenUniverseEvents> {
       totalSwapsTracked: totalSwaps,
       oldestTokenAge: this.tokens.size > 0 ? now - oldest : 0,
       newestTokenAge: this.tokens.size > 0 ? now - newest : 0,
+      rejectedMintsCount: this.rejectedMints.size,
     };
   }
 }

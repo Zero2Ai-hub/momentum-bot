@@ -1,19 +1,17 @@
 /**
  * On-chain Event Listener
  * Subscribes to Solana WebSocket streams and ingests swap events.
+ * 
+ * FIX: Now blocks swap emission until token mint is verified as a real SPL token.
  */
 
-import { Connection, PublicKey, LogsFilter } from '@solana/web3.js';
+import { Connection, PublicKey } from '@solana/web3.js';
 import EventEmitter from 'eventemitter3';
 import { SwapEvent, DEXSource, DEX_PROGRAM_IDS, LogEventType } from '../types';
 import { getConfig } from '../config/config';
 import { logEvent, log } from '../logging/logger';
-import { parseRaydiumSwap } from './parsers/raydium';
-import { parseOrcaSwap } from './parsers/orca';
-import { parsePumpSwap } from './parsers/pumpswap';
-import { parsePumpFunSwap } from './parsers/pumpfun';
 import { validateSwapEvent } from './parsers/known-addresses';
-import { isVerifiedToken, queueTokenVerification, initializeTokenVerifier } from './token-verifier';
+import { isValidTradeableToken, initializeTokenVerifier } from './token-verifier';
 import { parseTransactionWithHelius } from './helius-parser';
 
 interface EventListenerEvents {
@@ -62,7 +60,7 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     const config = getConfig();
     this.isRunning = true;
     
-    // Initialize token verifier (loads Jupiter token list)
+    // Initialize token verifier
     await initializeTokenVerifier();
     
     // Create HTTP connection for queries
@@ -105,8 +103,6 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     const config = getConfig();
     
     try {
-      // Create connection with HTTP URL, WebSocket endpoint in options
-      // The Connection class requires http(s) URL as first arg
       this.wsConnection = new Connection(config.rpcUrl, {
         commitment: 'confirmed',
         wsEndpoint: config.wsUrl,
@@ -179,6 +175,9 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
   
   /**
    * Parse transaction using Helius for accurate token mint extraction
+   * 
+   * FIX: Now AWAITS token verification before emitting SWAP_DETECTED.
+   * Only emits if the token mint is verified as a real SPL token mint.
    */
   private async parseWithHelius(
     signature: string,
@@ -199,7 +198,7 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
         event.dexSource = source;
       }
       
-      // Validate the swap event
+      // Basic structural validation (wallet vs mint, notional bounds)
       const validation = validateSwapEvent(
         event.tokenMint,
         event.walletAddress,
@@ -210,20 +209,23 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
         return;
       }
       
-      // RPC VERIFICATION: Check if token is a real SPL token mint
-      const verificationStatus = isVerifiedToken(event.tokenMint);
+      // ═══════════════════════════════════════════════════════════════
+      // FIX (P0): BLOCK EMISSION UNTIL MINT IS VERIFIED
+      // ═══════════════════════════════════════════════════════════════
+      // This awaits RPC verification - does NOT emit for unverified mints
+      const isValidMint = await isValidTradeableToken(event.tokenMint);
       
-      if (verificationStatus === false) {
-        // Token was verified and is NOT a real token - skip it
+      if (!isValidMint) {
+        log.debug('Rejected non-mint address', { 
+          signature: signature.slice(0, 16), 
+          mint: event.tokenMint.slice(0, 16) 
+        });
         return;
       }
       
-      if (verificationStatus === undefined) {
-        // Queue for verification
-        queueTokenVerification(event.tokenMint);
-      }
-      
-      // Log and emit the event
+      // ═══════════════════════════════════════════════════════════════
+      // VERIFIED: Token mint is a real SPL token - safe to emit
+      // ═══════════════════════════════════════════════════════════════
       logEvent(LogEventType.SWAP_DETECTED, {
         signature: event.signature,
         tokenMint: event.tokenMint,
@@ -237,38 +239,6 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
       
     } catch (error) {
       log.debug('Helius parse error', { signature: signature.slice(0, 16), error: (error as Error).message });
-    }
-  }
-  
-  /**
-   * Parse logs into swap events based on DEX source
-   */
-  private parseLogs(
-    signature: string,
-    slot: number,
-    logs: string[],
-    source: DEXSource
-  ): SwapEvent[] {
-    switch (source) {
-      case DEXSource.RAYDIUM_V4:
-      case DEXSource.RAYDIUM_CLMM:
-        return parseRaydiumSwap(signature, slot, logs, source);
-      
-      case DEXSource.ORCA_WHIRLPOOL:
-        return parseOrcaSwap(signature, slot, logs);
-      
-      case DEXSource.METEORA:
-        // Meteora uses similar structure to Raydium
-        return parseRaydiumSwap(signature, slot, logs, source);
-      
-      case DEXSource.PUMPSWAP:
-        return parsePumpSwap(signature, slot, logs);
-      
-      case DEXSource.PUMPFUN:
-        return parsePumpFunSwap(signature, slot, logs);
-      
-      default:
-        return [];
     }
   }
   
@@ -322,7 +292,6 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
    */
   private cleanupSignatures(): void {
     if (this.recentSignatures.size > this.maxSignatures) {
-      // Keep only the most recent half
       const toKeep = Array.from(this.recentSignatures).slice(-this.maxSignatures / 2);
       this.recentSignatures.clear();
       for (const sig of toKeep) {

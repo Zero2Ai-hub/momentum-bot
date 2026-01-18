@@ -205,7 +205,11 @@ async function runScenario(scenario: TestScenario): Promise<TestResult> {
   
   // Process events
   for (const event of scenario.events) {
-    const tokenState = universe.processSwap(event);
+    const tokenState = await universe.processSwap(event);
+    
+    // Skip if token validation failed
+    if (!tokenState) continue;
+    
     const score = scorer.calculateScore(tokenState);
     lastScore = score.totalScore;
     
