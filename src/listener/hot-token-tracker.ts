@@ -125,6 +125,11 @@ export class HotTokenTracker {
    * Check if a token has crossed the hot threshold
    */
   private checkHotStatus(tokenMint: string, activity: TokenActivity): void {
+    // EARLY EXIT: Check if already triggered FIRST (prevents race condition)
+    if (this.hotTokensTriggered.has(tokenMint)) {
+      return;
+    }
+    
     const now = Date.now();
     const windowStart = now - this.hotTokenWindowMs;
     
@@ -141,10 +146,9 @@ export class HotTokenTracker {
     
     // Check threshold
     if (activity.swapCount >= this.hotTokenThreshold) {
-      // Check if we already triggered for this token recently
-      if (this.hotTokensTriggered.has(tokenMint)) {
-        return;
-      }
+      // ATOMIC: Mark as triggered IMMEDIATELY before any async work
+      // This prevents race conditions when multiple swaps arrive simultaneously
+      this.hotTokensTriggered.add(tokenMint);
       
       // Check buy/sell ratio - want more buys than sells for momentum
       const buyRatio = activity.estimatedBuys / Math.max(activity.swapCount, 1);
@@ -158,9 +162,6 @@ export class HotTokenTracker {
         buyRatio: (buyRatio * 100).toFixed(0) + '%',
         windowMs: now - activity.firstSeen,
       });
-      
-      // Mark as triggered
-      this.hotTokensTriggered.add(tokenMint);
       
       // Trigger callbacks (Phase 2 RPC verification)
       for (const callback of this.hotTokenCallbacks) {
