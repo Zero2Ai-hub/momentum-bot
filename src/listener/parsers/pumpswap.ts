@@ -54,6 +54,9 @@ function isInfrastructure(address: string): boolean {
 
 /**
  * Check if an address is a likely real token mint
+ * 
+ * CRITICAL: All pump.fun/pumpswap tokens end with "pump" - this is by design!
+ * This filters out 95%+ of false positives (pool addresses, authorities, etc.)
  */
 function isLikelyTokenMint(address: string): boolean {
   if (!isValidTokenMint(address)) {
@@ -61,6 +64,12 @@ function isLikelyTokenMint(address: string): boolean {
   }
   
   if (isInfrastructure(address)) {
+    return false;
+  }
+  
+  // CRITICAL: PumpSwap tokens MUST end with "pump"
+  // This is the strongest filter against pool/authority addresses
+  if (!address.endsWith('pump')) {
     return false;
   }
   
