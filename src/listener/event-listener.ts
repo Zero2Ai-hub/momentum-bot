@@ -359,32 +359,79 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     log.info(`🚀 Phase 2: Verifying hot token ${tokenMint}`);
     
     try {
-      // Verify token is real SPL mint (uses RPC - CREDITS)
-      const isValid = await isValidTradeableToken(tokenMint);
-      
-      if (!isValid) {
-        log.debug('Hot token rejected - not a valid SPL mint', { tokenMint });
-        return;
-      }
-      
-      // Get stored signatures for this token and verify with RPC
+      // Get stored signatures for this candidate token
       const signatures = this.hotTokenSignatures.get(tokenMint);
       if (!signatures || signatures.size === 0) {
-        log.debug('No signatures stored for hot token', { tokenMint });
+        log.debug(`⚠️ No signatures stored for hot token candidate ${tokenMint}`);
         return;
       }
       
-      // Verify recent transactions with full RPC parsing
+      // Strategy: Use signatures to find REAL token mints via getParsedTransaction
+      // The candidate mint from Phase 1 might be wrong (pool address, authority, etc.)
+      // Phase 2 uses proper Helius parsing to find actual traded tokens
+      
       const signatureArr = Array.from(signatures).slice(-5); // Last 5 signatures
+      const verifiedMints = new Map<string, number>(); // mint -> count
+      
+      log.debug(`🔍 Phase 2: Parsing ${signatureArr.length} signatures for candidate ${tokenMint.slice(0, 8)}...`);
       
       for (const sig of signatureArr) {
-        await this.verifyAndEmitSwap(sig, tokenMint);
+        const realMint = await this.findRealTokenFromSignature(sig);
+        if (realMint) {
+          verifiedMints.set(realMint, (verifiedMints.get(realMint) || 0) + 1);
+        }
+      }
+      
+      // Find the most common verified mint from these signatures
+      let bestMint: string | null = null;
+      let bestCount = 0;
+      for (const [mint, count] of verifiedMints) {
+        if (count > bestCount) {
+          bestMint = mint;
+          bestCount = count;
+        }
+      }
+      
+      if (!bestMint) {
+        log.info(`❌ Phase 2: No valid token found in signatures for candidate ${tokenMint.slice(0, 16)}...`);
+        return;
+      }
+      
+      log.info(`✅ Phase 2 FOUND REAL TOKEN: ${bestMint} (from ${bestCount}/${signatureArr.length} sigs)`);
+      
+      // Now emit swap events for this verified mint
+      for (const sig of signatureArr) {
+        await this.verifyAndEmitSwap(sig, bestMint);
       }
       
     } catch (error) {
       log.error('Phase 2 verification error', error as Error);
     } finally {
       this.pendingHotTokenVerifications.delete(tokenMint);
+    }
+  }
+  
+  /**
+   * Find the REAL token mint from a signature using RPC parsing
+   */
+  private async findRealTokenFromSignature(signature: string): Promise<string | null> {
+    if (!this.connection) return null;
+    
+    try {
+      const event = await parseTransactionWithHelius(this.connection, signature, 0);
+      if (!event || !event.tokenMint || event.tokenMint === 'unknown') {
+        return null;
+      }
+      
+      // Verify this is a real SPL mint
+      const isValid = await isValidTradeableToken(event.tokenMint);
+      if (!isValid) {
+        return null;
+      }
+      
+      return event.tokenMint;
+    } catch (error) {
+      return null;
     }
   }
   
@@ -399,7 +446,8 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
       
       if (!event) return;
       
-      // Ensure this is for the expected token
+      // Accept if the event's token matches the expected mint OR if the expected mint is verified
+      // This handles cases where the same signature might involve multiple tokens
       if (event.tokenMint !== expectedMint) {
         return;
       }
