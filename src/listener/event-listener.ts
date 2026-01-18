@@ -273,13 +273,60 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
         candidate.wallet
       );
       
-      // ONLY buffer events from PUMPFUN/PUMPSWAP sources - they have REAL data!
-      // For non-pump sources (METEORA, RAYDIUM, ORCA), we only track signatures.
-      // Real data will be fetched via getParsedTransaction after Phase 2 verification.
+      // For PUMPFUN/PUMPSWAP sources: buffer events (they have real data from logs)
+      // For non-pump sources: parse signature if token is already verified (rate-limited)
       if (candidate.isPumpSource) {
         this.bufferPumpEvent(candidate);
+      } else if (this.verifiedMints.has(candidate.candidateAddress)) {
+        // Token already verified! Parse this signature to get REAL data
+        // Rate limit: only parse ~1 in 3 signatures to save credits
+        if (Math.random() < 0.33) {
+          this.parseAndEmitNonPumpEvent(candidate.candidateAddress, logs.signature);
+        }
       }
-      // Non-pump sources: signatures tracked above, will be parsed in Phase 2
+      // Non-pump unverified: signatures tracked via recordSwap, will be parsed in Phase 2
+    }
+  }
+  
+  /**
+   * Parse a single signature and emit event for verified non-pump token
+   * This enables ongoing real-time data after initial verification
+   */
+  private async parseAndEmitNonPumpEvent(tokenMint: string, signature: string): Promise<void> {
+    // Skip if already emitted
+    if (this.emittedSignatures.has(signature)) {
+      return;
+    }
+    
+    try {
+      const event = await parseTransactionWithHelius(this.connection!, signature, 0);
+      this.rpcCounters.getParsedTransaction++;
+      
+      if (event && event.tokenMint === tokenMint) {
+        const validation = validateSwapEvent(
+          event.tokenMint,
+          event.walletAddress,
+          event.notionalSol.toNumber()
+        );
+        
+        if (validation.valid) {
+          this.emittedSignatures.add(signature);
+          
+          logEvent(LogEventType.SWAP_DETECTED, {
+            signature: event.signature,
+            tokenMint: event.tokenMint,
+            direction: event.direction,
+            notionalSol: event.notionalSol.toString(),
+            wallet: event.walletAddress,
+            dex: event.dexSource,
+            phase: 'non_pump_realtime',
+          });
+          
+          this.emit('swap', event);
+        }
+      }
+    } catch (error) {
+      // Non-critical - just skip this signature
     }
   }
   
@@ -616,7 +663,8 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     
     // No buffered events = came from non-pump DEX (METEORA, RAYDIUM, ORCA)
     // Parse 1-3 signatures to get REAL wallet/direction/notional
-    const signatures = this.hotTokenTracker.getRecentSignatures(candidate, 3);
+    // Parse up to 10 signatures to get substantial initial data
+    const signatures = this.hotTokenTracker.getRecentSignatures(candidate, 10);
     
     if (signatures.length === 0) {
       log.debug(`No signatures to parse for ${candidate.slice(0, 16)}...`);
