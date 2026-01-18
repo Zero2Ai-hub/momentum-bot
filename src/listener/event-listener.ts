@@ -252,16 +252,7 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     const candidates = this.parseLogsPhase1(logs.signature, slot, logs.logs, source);
     
     for (const candidate of candidates) {
-      // For pump sources: candidateAddress is reliable mint
-      // For other sources: candidateAddress is unknown type (skip Phase 1 tracking)
-      
-      if (!candidate.isPumpSource) {
-        // P0-3: Don't track non-pump candidates in Phase 1
-        // They produce too many false positives (pool addresses, etc.)
-        continue;
-      }
-      
-      // Validate pump token format
+      // Validate pump token format - ALL pump.fun tokens end with "pump"
       if (!candidate.candidateAddress.endsWith('pump')) {
         continue;
       }
@@ -279,16 +270,20 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
         candidate.wallet
       );
       
-      // P0-4: Buffer pump events for later emission (no tx parsing needed)
-      this.bufferPumpEvent(candidate);
+      // Buffer pump events for later emission (no tx parsing needed)
+      // For pump sources, we have full event data
+      // For non-pump sources, we'll need Phase 2 to get full data
+      if (candidate.isPumpSource) {
+        this.bufferPumpEvent(candidate);
+      }
     }
   }
   
   /**
    * Phase 1: Parse raw logs to extract candidates (FREE - no RPC)
    * 
-   * P0-3 FIX: For pump sources, we extract tokenMint reliably.
-   * For other sources, we DON'T call it tokenMint - it's just a candidateAddress.
+   * KEY INSIGHT: pump.fun tokens ALWAYS end with "pump" - this is 100% reliable!
+   * We can detect pump.fun tokens from ANY DEX by scanning for addresses ending with "pump".
    */
   private parseLogsPhase1(
     signature: string,
@@ -301,32 +296,47 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     try {
       const isPumpSource = source === DEXSource.PUMPFUN || source === DEXSource.PUMPSWAP;
       
-      // Only parse pump sources in Phase 1
-      // Other sources produce unreliable candidates (pool addresses, etc.)
-      if (!isPumpSource) {
-        return results;
-      }
-      
-      // Parse pump-specific logs
-      let events: SwapEvent[] = [];
-      
-      switch (source) {
-        case DEXSource.PUMPFUN:
-          events = parsePumpFunSwap(signature, slot, logs);
-          break;
-        case DEXSource.PUMPSWAP:
-          events = parsePumpSwapLogs(signature, slot, logs);
-          break;
-      }
-      
-      for (const event of events) {
-        if (event.tokenMint && event.tokenMint !== 'unknown' && event.tokenMint.endsWith('pump')) {
+      if (isPumpSource) {
+        // Use DEX-specific parsers for pump sources
+        let events: SwapEvent[] = [];
+        
+        switch (source) {
+          case DEXSource.PUMPFUN:
+            events = parsePumpFunSwap(signature, slot, logs);
+            break;
+          case DEXSource.PUMPSWAP:
+            events = parsePumpSwapLogs(signature, slot, logs);
+            break;
+        }
+        
+        for (const event of events) {
+          if (event.tokenMint && event.tokenMint !== 'unknown' && event.tokenMint.endsWith('pump')) {
+            results.push({
+              candidateAddress: event.tokenMint,
+              isPumpSource: true,
+              isBuy: event.direction === SwapDirection.BUY,
+              wallet: event.walletAddress || 'unknown',
+              notionalSol: event.notionalSol,
+              signature,
+              dexSource: source,
+            });
+          }
+        }
+      } else {
+        // For non-pump DEXs (METEORA, RAYDIUM, ORCA, etc.):
+        // Scan logs for addresses ending with "pump" - these are pump.fun tokens traded on other DEXs!
+        // This is 100% reliable because only pump.fun creates tokens with "pump" suffix.
+        const pumpTokens = this.scanLogsForPumpTokens(logs);
+        
+        for (const tokenMint of pumpTokens) {
+          // For non-pump sources, we don't have direction/wallet info from logs
+          // Default to BUY since momentum tracking cares about activity, not direction
           results.push({
-            candidateAddress: event.tokenMint,
-            isPumpSource: true,
-            isBuy: event.direction === SwapDirection.BUY,
-            wallet: event.walletAddress || 'unknown',
-            notionalSol: event.notionalSol,
+            candidateAddress: tokenMint,
+            isPumpSource: false, // We know it's a pump token, but source is different DEX
+            isBuy: true, // Default assumption
+            wallet: 'unknown',
+            notionalSol: new Decimal(0.01), // Placeholder - actual amount determined in Phase 2
             signature,
             dexSource: source,
           });
@@ -337,6 +347,30 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     }
     
     return results;
+  }
+  
+  /**
+   * Scan raw logs for pump.fun token addresses (ending with "pump")
+   * This catches pump.fun tokens traded on ANY DEX (Meteora, Raydium, etc.)
+   */
+  private scanLogsForPumpTokens(logs: string[]): Set<string> {
+    const pumpTokens = new Set<string>();
+    
+    // Pattern: valid base58 address ending with "pump"
+    const pumpPattern = /([1-9A-HJ-NP-Za-km-z]{40,44}pump)\b/g;
+    
+    for (const log of logs) {
+      const matches = log.matchAll(pumpPattern);
+      for (const match of matches) {
+        const addr = match[1];
+        // Must be valid length (43-44 chars) and pass basic validation
+        if (addr.length >= 43 && addr.length <= 44 && isValidTokenMint(addr)) {
+          pumpTokens.add(addr);
+        }
+      }
+    }
+    
+    return pumpTokens;
   }
   
   /**
@@ -459,9 +493,13 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     try {
       // ═══════════════════════════════════════════════════════════════
       // P1-5: Quality Gate (Anti-Noise)
+      // Only apply if we HAVE wallet info (uniqueWallets > 0 or known wallets)
+      // For non-pump sources, we can't extract wallets so uniqueWallets=0 is expected
       // ═══════════════════════════════════════════════════════════════
       
-      if (stats.uniqueWallets < MIN_UNIQUE_WALLETS) {
+      // If we have SOME wallet info but it's too concentrated, reject as noise
+      // But if uniqueWallets=0, it means we couldn't extract wallets - skip this check
+      if (stats.uniqueWallets > 0 && stats.uniqueWallets < MIN_UNIQUE_WALLETS) {
         log.info(`❌ Phase 2 NOISE: ${candidate.slice(0, 16)}... - only ${stats.uniqueWallets} unique wallets (min: ${MIN_UNIQUE_WALLETS})`);
         logEvent(LogEventType.PHASE2_NOISE_REJECTED, {
           candidate,
