@@ -21,7 +21,7 @@ let connection: Connection | null = null;
 
 // Rate limiting for RPC calls
 let lastRpcCall = 0;
-const MIN_RPC_INTERVAL_MS = 50; // Max 20 calls/second
+const MIN_RPC_INTERVAL_MS = 100; // Max 10 calls/second (Helius free tier limit)
 
 // Token Program IDs
 const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
@@ -90,6 +90,9 @@ function isValidBase58Address(address: string): boolean {
   }
 }
 
+// Queue for serializing RPC calls to avoid 429s
+let rpcQueue: Promise<any> = Promise.resolve();
+
 /**
  * Check if an address is a valid SPL token mint using RPC
  * Returns true ONLY if the address is a valid token mint account (82 bytes, owned by Token Program)
@@ -110,21 +113,40 @@ async function verifyTokenViaRpc(tokenMint: string): Promise<boolean> {
     return false; // Can't verify without connection
   }
   
+  // Serialize RPC calls through queue to prevent 429s
+  const result = await new Promise<boolean>((resolve) => {
+    rpcQueue = rpcQueue.then(async () => {
+      // Rate limiting between calls
+      const now = Date.now();
+      if (now - lastRpcCall < MIN_RPC_INTERVAL_MS) {
+        await new Promise(r => setTimeout(r, MIN_RPC_INTERVAL_MS - (now - lastRpcCall)));
+      }
+      lastRpcCall = Date.now();
+      
+      try {
+        const verified = await doRpcVerification(tokenMint);
+        resolve(verified);
+      } catch {
+        resolve(false);
+      }
+    });
+  });
+  
+  return result;
+}
+
+/**
+ * Perform the actual RPC verification with retry on 429
+ */
+async function doRpcVerification(tokenMint: string, retries = 2): Promise<boolean> {
   try {
-    // Rate limiting
-    const now = Date.now();
-    if (now - lastRpcCall < MIN_RPC_INTERVAL_MS) {
-      await new Promise(resolve => setTimeout(resolve, MIN_RPC_INTERVAL_MS));
-    }
-    lastRpcCall = Date.now();
-    
     const pubkey = new PublicKey(tokenMint);
     
     // Get account info with timeout
     const accountInfo = await Promise.race([
-      connection.getAccountInfo(pubkey),
+      connection!.getAccountInfo(pubkey),
       new Promise<null>((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
-    ]) as Awaited<ReturnType<typeof connection.getAccountInfo>>;
+    ]) as Awaited<ReturnType<Connection['getAccountInfo']>>;
     
     if (!accountInfo) {
       // Account doesn't exist - not a valid token
@@ -164,10 +186,18 @@ async function verifyTokenViaRpc(tokenMint: string): Promise<boolean> {
     return false;
     
   } catch (error) {
-    // Invalid address or RPC error
+    const errMsg = (error as Error).message || '';
+    
+    // Retry on 429 (rate limit)
+    if (errMsg.includes('429') && retries > 0) {
+      log.debug('Rate limited, retrying...', { token: tokenMint.slice(0, 8), retries });
+      await new Promise(r => setTimeout(r, 500 * (3 - retries))); // Backoff: 500ms, 1000ms
+      return doRpcVerification(tokenMint, retries - 1);
+    }
+    
     log.debug('Token verification failed', { 
       token: tokenMint.slice(0, 16), 
-      error: (error as Error).message 
+      error: errMsg
     });
     return false;
   }
