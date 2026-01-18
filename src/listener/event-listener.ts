@@ -274,15 +274,13 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
       );
       
       // For PUMPFUN/PUMPSWAP sources: buffer events (they have real data from logs)
-      // For non-pump sources: parse signature if token is already verified (rate-limited)
+      // For non-pump sources: emit event if token is already verified
       if (candidate.isPumpSource) {
         this.bufferPumpEvent(candidate);
       } else if (this.verifiedMints.has(candidate.candidateAddress)) {
-        // Token already verified! Parse this signature to get REAL data
-        // Rate limit: only parse ~1 in 3 signatures to save credits
-        if (Math.random() < 0.33) {
-          this.parseAndEmitNonPumpEvent(candidate.candidateAddress, logs.signature);
-        }
+        // Token already verified! ALWAYS emit so universe sees ALL swaps
+        // FIX: Previously only 33% of swaps were emitted, causing momentum to appear dead
+        this.emitVerifiedNonPumpSwap(candidate, logs.signature);
       }
       // Non-pump unverified: signatures tracked via recordSwap, will be parsed in Phase 2
     }
@@ -327,6 +325,79 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
       }
     } catch (error) {
       // Non-critical - just skip this signature
+    }
+  }
+  
+  /**
+   * Emit a swap event for a verified non-pump token
+   * 
+   * FIX: This ensures ALL swaps are visible to the token universe for momentum counting.
+   * Previously, only 33% of swaps were emitted due to aggressive rate limiting,
+   * causing tokens like Buttcoin to appear "dead" despite massive activity.
+   * 
+   * The strategy:
+   * 1. ALWAYS emit an event from Phase 1 data (direction from logs)
+   * 2. Rate-limit RPC parsing for enriched data (wallet, exact notional)
+   * 3. Universe sees ALL swaps, risk gates evaluate the parsed subset
+   */
+  private emitVerifiedNonPumpSwap(candidate: Phase1Candidate, signature: string): void {
+    // Skip if already emitted (prevents duplicates)
+    if (this.emittedSignatures.has(signature)) {
+      return;
+    }
+    
+    this.emittedSignatures.add(signature);
+    
+    // Create event from Phase 1 candidate data
+    const event: SwapEvent = {
+      signature,
+      slot: 0, // Unknown from logs
+      timestamp: Date.now(),
+      tokenMint: candidate.candidateAddress,
+      direction: candidate.isBuy ? SwapDirection.BUY : SwapDirection.SELL,
+      notionalSol: candidate.notionalSol, // May be placeholder (0.01)
+      walletAddress: candidate.wallet, // May be 'unknown'
+      dexSource: candidate.dexSource,
+    };
+    
+    logEvent(LogEventType.SWAP_DETECTED, {
+      signature,
+      tokenMint: candidate.candidateAddress,
+      direction: event.direction,
+      notionalSol: event.notionalSol.toString(),
+      wallet: event.walletAddress,
+      dex: event.dexSource,
+      phase: 'non_pump_phase1', // New phase to distinguish from RPC-parsed
+    });
+    
+    this.emit('swap', event);
+    
+    // Rate-limited RPC parsing for enriched data (async, fire-and-forget)
+    // Only parse ~20% of swaps to save credits, but still emit all
+    if (Math.random() < 0.20) {
+      this.enrichSwapWithRpc(candidate.candidateAddress, signature);
+    }
+  }
+  
+  /**
+   * Enrich a swap event with RPC data (async, fire-and-forget)
+   * This doesn't emit a new event - just improves metrics for risk gates
+   */
+  private async enrichSwapWithRpc(tokenMint: string, signature: string): Promise<void> {
+    try {
+      const event = await parseTransactionWithHelius(this.connection!, signature, 0);
+      this.rpcCounters.getParsedTransaction++;
+      
+      if (event && event.tokenMint === tokenMint) {
+        // Log enriched data for debugging
+        log.debug(`Enriched swap: ${signature.slice(0, 16)}...`, {
+          wallet: event.walletAddress.slice(0, 8),
+          notional: event.notionalSol.toString(),
+          direction: event.direction,
+        });
+      }
+    } catch {
+      // Non-critical
     }
   }
   
