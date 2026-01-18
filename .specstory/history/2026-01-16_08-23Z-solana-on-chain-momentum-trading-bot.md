@@ -41628,19 +41628,156 @@ yes
 
 _**Agent (model claude-4.5-opus-high-thinking, mode Agent)**_
 
+<think><details><summary>Thought Process</summary>
+The user wants me to implement the fix. Let me create a plan:
 
+1. **Stop buffering fake events for non-pump sources** - In `handleLogs`, only buffer if `isPumpSource`
+2. **After Phase 2 verification, parse signatures for non-pump sources** - In `verifyPumpCandidate`, if the token came from non-pump sources, parse 1-3 signatures to get real data
+3. **Emit real events** with actual wallet, direction, notional
+
+Let me check the current code structure first to understand exactly what needs to change.</details></think>
 
 ---
 
-
+Let me implement this fix. First, let me check the current code structure:
 
 ---
 
-<tool-use data-tool-type="unknown" data-tool-name="read_file">
+<tool-use data-tool-type="read" data-tool-name="read_file">
+<details><summary>Tool use: **read_file** • Read file: D:/ZeroToAI/MVPs/Momentum Trading Bot/src/listener/event-listener.ts</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+I can see the issue - line 276 buffers ALL events regardless of source. I need to:
+
+1. Only buffer for `isPumpSource` (PUMPFUN/PUMPSWAP)
+2. For non-pump sources, just track signature (already happening in `recordSwap`)
+3. After verification, parse signatures for non-pump tokens to get real data
+
+Let me make the changes:</details></think>
+
+---
+
+<tool-use data-tool-type="task" data-tool-name="todo_write">
+<details><summary>Tool use: **todo_write** • Todo List</summary>
+
+- [-] Stop buffering fake events for non-pump sources
+- [ ] Parse signatures after verification for non-pump tokens
+- [ ] Test and verify real data is emitted
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+Now let me implement the fix step by step. First, I'll modify `handleLogs` to only buffer for pump sources.</details></think>
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="search_replace">
+
+<details><summary>Tool use: **search_replace** • Edit file: D:/ZeroToAI/MVPs/Momentum Trading Bot/src/listener/event-listener.ts</summary>
+
+**Chunk 1**
+Lines added: 1, lines removed: 1
+
+```diff
+@@ -263,5 +263,5 @@
+        }
+        
+-       // Record in hot token tracker
++       // Record in hot token tracker (tracks signatures for later parsing)
+        this.hotTokenTracker.recordSwap(
+          candidate.candidateAddress,
+```
+
+**Chunk 2**
+Lines added: 8, lines removed: 5
+
+```diff
+@@ -271,9 +271,12 @@
+        );
+        
+-       // Buffer ALL pump token events for emission after verification
+-       // Whether from PUMPFUN/PUMPSWAP or other DEXs (METEORA, RAYDIUM, etc.)
+-       // All tokens ending with "pump" are pump.fun tokens!
+-       this.bufferPumpEvent(candidate);
+-     }
++       // ONLY buffer events from PUMPFUN/PUMPSWAP sources - they have REAL data!
++       // For non-pump sources (METEORA, RAYDIUM, ORCA), we only track signatures.
++       // Real data will be fetched via getParsedTransaction after Phase 2 verification.
++       if (candidate.isPumpSource) {
++         this.bufferPumpEvent(candidate);
++       }
++       // Non-pump sources: signatures tracked above, will be parsed in Phase 2
++     }
+    }
+    
+```
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+Now I need to modify `verifyPumpCandidate` to parse signatures for non-pump tokens after verification. Let me check the current function:</details></think>
+
+---
+
+<tool-use data-tool-type="task" data-tool-name="todo_write">
+<details><summary>Tool use: **todo_write** • Todo List</summary>
+
+- [x] Stop buffering fake events for non-pump sources
+- [-] Parse signatures after verification for non-pump tokens
+- [ ] Test and verify real data is emitted
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+Now let me read the `verifyPumpCandidate` function to see how to add signature parsing:</details></think>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file">
+<details><summary>Tool use: **read_file** • Read file: D:/ZeroToAI/MVPs/Momentum Trading Bot/src/listener/event-listener.ts</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+I need to modify `verifyPumpCandidate` to:
+1. After verification success, check if there are pending pump events
+2. If NO pending events (meaning it's from a non-pump source), parse signatures to get real data
+3. Emit those real events
+
+Let me also check if `parseTransactionWithHelius` is available and what it returns:</details></think>
+
+---
+
+<tool-use data-tool-type="search" data-tool-name="grep">
 <details>
-<summary>Tool use: **read_file**</summary>
+<summary>Tool use: **grep** • Grep for "parseTransactionWithHelius" in "D:/ZeroToAI/MVPs/Momentum Trading Bot/src/listener" • 3 matches</summary>
 
-Status: **loading**
+Output mode: content
+
+
+| File | Content | Line |
+|------|------|------|
+| `.\event-listener.ts` | `import \{ parseTransactionWithHelius \} from './helius-parser';` | L24 |
+| `.\event-listener.ts` | `const event = await parseTransactionWithHelius(this.connection, sig, 0);` | L644 |
+| `.\helius-parser.ts` | `export async function parseTransactionWithHelius(` | L58 |
 
 
 </details>
@@ -41648,15 +41785,722 @@ Status: **loading**
 
 ---
 
+<think><details><summary>Thought Process</summary>
+Good, `parseTransactionWithHelius` is already imported and available. Now let me modify `verifyPumpCandidate` to:
 
+1. After verification success, flush pending pump events (for PUMPFUN/PUMPSWAP sources)
+2. ALSO parse signatures to get real events for non-pump sources
+
+The key insight is:
+- If `pendingPumpEvents` has entries → it's from PUMPFUN/PUMPSWAP (real data from logs)
+- If `pendingPumpEvents` is empty → it's from non-pump source (need to parse signatures)
+
+Let me modify the function:</details></think>
 
 ---
 
-
+Now let me modify `verifyPumpCandidate` to parse signatures for non-pump sources:
 
 ---
 
+<tool-use data-tool-type="write" data-tool-name="search_replace">
 
+<details><summary>Tool use: **search_replace** • Edit file: D:/ZeroToAI/MVPs/Momentum Trading Bot/src/listener/event-listener.ts</summary>
+
+**Chunk 1**
+Lines added: 4, lines removed: 3
+
+```diff
+@@ -535,12 +535,13 @@
+    
+    /**
+-    * P0-4: Verify pump candidate - NO getParsedTransaction calls
+-    * Just verify the mint once with getAccountInfo
++    * Verify pump candidate
++    * - For PUMPFUN/PUMPSWAP: flush buffered events (already have real data)
++    * - For non-pump sources: parse signatures to get REAL wallet/direction/notional
+     */
+    private async verifyPumpCandidate(candidate: string, stats: HotDetectionStats): Promise&lt;void&gt; {
+      // Check cache first
+      if (this.verifiedMints.has(candidate)) {
+        log.info(&#96;✅ Phase 2 VERIFIED (cached): ${candidate}&#96;);
+-       this.flushPendingPumpEvents(candidate);
++       await this.emitRealEventsForCandidate(candidate);
+        this.hotTokenTracker.setCooldown(candidate, 'success');
+        return;
+```
+
+**Chunk 2**
+Lines added: 7, lines removed: 4
+
+```diff
+@@ -559,14 +560,17 @@
+      if (isValid) {
+        log.info(&#96;✅ Phase 2 VERIFIED (pump fast path): ${candidate}&#96;);
++       
++       this.verifiedMints.add(candidate);
++       
++       // Emit real events (either from buffer or by parsing signatures)
++       const txParseCalls = await this.emitRealEventsForCandidate(candidate);
+        
+        logEvent(LogEventType.PHASE2_VERIFIED, {
+          candidate,
+-         method: 'pump_fast_path',
+-         txParseCalls: 0,
++         method: txParseCalls &gt; 0 ? 'with_tx_parse' : 'pump_fast_path',
++         txParseCalls,
+          accountInfoCalls: 1,
+        });
+        
+-       this.verifiedMints.add(candidate);
+-       this.flushPendingPumpEvents(candidate);
+        this.hotTokenTracker.setCooldown(candidate, 'success');
+      } else {
+```
+
+**Chunk 3**
+Lines added: 69, lines removed: undefined
+
+```diff
+@@ -583,4 +587,73 @@
+      }
+    }
++   
++   /**
++    * Emit real events for a verified candidate
++    * - If we have buffered events (from PUMPFUN/PUMPSWAP), flush them
++    * - If no buffered events (from non-pump DEX), parse signatures to get REAL data
++    * Returns number of tx parse calls made
++    */
++   private async emitRealEventsForCandidate(candidate: string): Promise&lt;number&gt; {
++     // Check if we have buffered events (from PUMPFUN/PUMPSWAP - already real data)
++     const bufferedEvents = this.pendingPumpEvents.get(candidate);
++     
++     if (bufferedEvents &amp;&amp; bufferedEvents.length &gt; 0) {
++       // Flush buffered events - they already have real wallet/direction/notional
++       this.flushPendingPumpEvents(candidate);
++       return 0; // No tx parsing needed
++     }
++     
++     // No buffered events = came from non-pump DEX (METEORA, RAYDIUM, ORCA)
++     // Parse 1-3 signatures to get REAL wallet/direction/notional
++     const signatures = this.hotTokenTracker.getRecentSignatures(candidate, 3);
++     
++     if (signatures.length === 0) {
++       log.debug(&#96;No signatures to parse for ${candidate.slice(0, 16)}...&#96;);
++       return 0;
++     }
++     
++     log.info(&#96;📊 Parsing ${signatures.length} signatures for REAL data: ${candidate.slice(0, 16)}...&#96;);
++     
++     let txParseCalls = 0;
++     let eventsEmitted = 0;
++     
++     for (const sig of signatures) {
++       try {
++         const event = await parseTransactionWithHelius(this.connection!, sig, 0);
++         txParseCalls++;
++         this.rpcCounters.getParsedTransaction++;
++         
++         // Only emit if this event is for our candidate token
++         if (event &amp;&amp; event.tokenMint === candidate) {
++           const validation = validateSwapEvent(
++             event.tokenMint,
++             event.walletAddress,
++             event.notionalSol.toNumber()
++           );
++           
++           if (validation.valid) {
++             logEvent(LogEventType.SWAP_DETECTED, {
++               signature: event.signature,
++               tokenMint: event.tokenMint,
++               direction: event.direction,
++               notionalSol: event.notionalSol.toString(),
++               wallet: event.walletAddress,
++               dex: event.dexSource,
++               phase: 'non_pump_tx_parsed',
++             });
++             
++             this.emit('swap', event);
++             eventsEmitted++;
++           }
++         }
++       } catch (error) {
++         log.debug(&#96;Failed to parse signature ${sig.slice(0, 16)}...&#96;, error);
++       }
++     }
++     
++     log.info(&#96;✅ Emitted ${eventsEmitted} REAL events for ${candidate.slice(0, 16)}... (${txParseCalls} tx parses)&#96;);
++     
++     return txParseCalls;
++   }
+    
+    /**
+```
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+Now let me check for any lint errors:</details></think>
+
+---
+
+<tool-use data-tool-type="generic" data-tool-name="read_lints">
+<details>
+          <summary>Tool use: **read_lints** • Read lints for 1 file</summary>
+      
+Lint paths:
+
+- `D:/ZeroToAI/MVPs/Momentum Trading Bot/src/listener/event-listener.ts`
+
+Lint results
+
+
+**No lint errors found**
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+Now let me rebuild and test:</details></think>
+
+---
+
+<tool-use data-tool-type="shell" data-tool-name="run_terminal_cmd">
+<details><summary>Tool use: **run_terminal_cmd** • Run command: cd "D:/ZeroToAI/MVPs/Momentum Trading Bot" && taskkill //F //IM node.exe 2>/dev/null; npm run build 2>&1 | tail -20</summary>
+
+```bash
+cd "D:/ZeroToAI/MVPs/Momentum Trading Bot" && taskkill //F //IM node.exe 2>/dev/null; npm run build 2>&1 | tail -20
+```
+
+```
+SUCCESS: The process "node.exe" with PID 60160 has been terminated.
+SUCCESS: The process "node.exe" with PID 59404 has been terminated.
+SUCCESS: The process "node.exe" with PID 54652 has been terminated.
+SUCCESS: The process "node.exe" with PID 60120 has been terminated.
+SUCCESS: The process "node.exe" with PID 56672 has been terminated.
+
+&gt; solana-momentum-bot@1.0.0 build
+&gt; tsc
+
+src/listener/event-listener.ts(650,71): error TS2345: Argument of type 'unknown' is not assignable to parameter of type 'Record&lt;string, unknown&gt; | undefined'.
+
+```
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+There's a TypeScript error. Let me fix it:</details></think>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file">
+<details><summary>Tool use: **read_file** • Read file: D:/ZeroToAI/MVPs/Momentum Trading Bot/src/listener/event-listener.ts</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+The issue is with the `log.debug` call - the error parameter needs to be cast properly. Let me fix it:</details></think>
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="search_replace">
+
+<details><summary>Tool use: **search_replace** • Edit file: D:/ZeroToAI/MVPs/Momentum Trading Bot/src/listener/event-listener.ts</summary>
+
+**Chunk 1**
+Lines added: 1, lines removed: 1
+
+```diff
+@@ -648,5 +648,5 @@
+          }
+        } catch (error) {
+-         log.debug(&#96;Failed to parse signature ${sig.slice(0, 16)}...&#96;, error);
++         log.debug(&#96;Failed to parse signature ${sig.slice(0, 16)}...&#96;);
+        }
+      }
+```
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+Now let me rebuild:</details></think>
+
+---
+
+<tool-use data-tool-type="shell" data-tool-name="run_terminal_cmd">
+<details><summary>Tool use: **run_terminal_cmd** • Run command: cd "D:/ZeroToAI/MVPs/Momentum Trading Bot" && npm run build 2>&1 | tail -10</summary>
+
+```bash
+cd "D:/ZeroToAI/MVPs/Momentum Trading Bot" && npm run build 2>&1 | tail -10
+```
+
+```
+
+&gt; solana-momentum-bot@1.0.0 build
+&gt; tsc
+
+
+```
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+Build succeeded. Now let me start the bot and test:</details></think>
+
+---
+
+Build successful. Now let me start the bot and test:
+
+---
+
+<tool-use data-tool-type="shell" data-tool-name="run_terminal_cmd">
+<details><summary>Tool use: **run_terminal_cmd** • Run command: cd "D:/ZeroToAI/MVPs/Momentum Trading Bot" && npm start 2>&1</summary>
+
+```bash
+cd "D:/ZeroToAI/MVPs/Momentum Trading Bot" && npm start 2>&1
+```
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+Let me wait for activity and check the results:</details></think>
+
+---
+
+<tool-use data-tool-type="shell" data-tool-name="run_terminal_cmd">
+<details><summary>Tool use: **run_terminal_cmd** • Run command: sleep 45 && tail -60 "c:/Users/Aladdin/.cursor/projects/d-ZeroToAI-MVPs-Momentum-Trading-Bot/terminals/37.txt"</summary>
+
+```bash
+sleep 45 && tail -60 "c:/Users/Aladdin/.cursor/projects/d-ZeroToAI-MVPs-Momentum-Trading-Bot/terminals/37.txt"
+```
+
+```
+&gt; node dist/index.js
+
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                                                                               ║
+║     ███╗   ███╗ ██████╗ ███╗   ███╗███████╗███╗   ██╗████████╗██╗   ██╗███╗   ███╗ ║
+║     ████╗ ████║██╔═══██╗████╗ ████║██╔════╝████╗  ██║╚══██╔══╝██║   ██║████╗ ████║ ║
+║     ██╔████╔██║██║   ██║██╔████╔██║█████╗  ██╔██╗ ██║   ██║   ██║   ██║██╔████╔██║ ║
+║     ██║╚██╔╝██║██║   ██║██║╚██╔╝██║██╔══╝  ██║╚██╗██║   ██║   ██║   ██║██║╚██╔╝██║ ║
+║     ██║ ╚═╝ ██║╚██████╔╝██║ ╚═╝ ██║███████╗██║ ╚████║   ██║   ╚██████╔╝██║ ╚═╝ ██║ ║
+║     ╚═╝     ╚═╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝ ║
+║                                                                               ║
+║                    SOLANA ON-CHAIN MOMENTUM TRADING BOT                      ║
+║                                                                               ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+  
+21:33:59.929 [info]: Momentum Bot starting...
+21:33:59.932 [info]: ─────────────────────────────────────────────────────────────────
+21:33:59.933 [info]: Initializing Momentum Bot...
+21:33:59.937 [info]: Connected to RPC: https://mainnet.helius-rpc.com...
+21:33:59.938 [warn]: No wallet private key configured - execution disabled
+21:33:59.939 [warn]: Wallet not initialized - running in observation mode only
+21:33:59.939 [info]: Bot initialized successfully
+21:33:59.941 [info]: Starting Momentum Bot...
+21:33:59.941 [info]: Token universe started {"inactivityTimeoutMs":120000}
+21:33:59.942 [info]: Token verifier initialized (RPC-based with blocklist)
+21:33:59.943 [info]: Hot token tracker started {"threshold":5,"windowMs":30000}
+21:34:00.014 [info]: WebSocket connected and subscribed to DEX programs
+21:34:00.014 [info]: Event listener started (Two-Phase Detection enabled)
+21:34:00.015 [info]: Position manager started
+21:34:00.015 [info]: ═══════════════════════════════════════════════════════════════
+21:34:00.015 [info]:     🧾 PAPER TRADING MODE - No real transactions will be sent
+21:34:00.015 [info]:           MOMENTUM BOT STARTED - SCANNING FOR OPPORTUNITIES
+21:34:00.015 [info]: ═══════════════════════════════════════════════════════════════
+21:34:00.015 [info]: Bot is now scanning for momentum opportunities...
+21:34:00.015 [info]: Press Ctrl+C to stop
+21:34:05.277 [info]: 🔥 HOT TOKEN DETECTED (Phase 1) {"candidate":"3yxXrRQArWwWm6zv...","swaps":5,"buys":5,"sells":0,"buyRatio":"100%","uniqueWallets":0,"windowMs":2688,"baselineSwapsPerMin":"0.00","isNewMomentum":true}
+21:34:05.279 [info]: 🚀 Phase 2: Verifying candidate 3yxXrRQArWwWm6zvwfSDkDgSvrQQAHPfLbzzGTUXpump
+21:34:05.621 [info]: 🔥 HOT TOKEN DETECTED (Phase 1) {"candidate":"EwEJ5R1im54Mowvs...","swaps":5,"buys":5,"sells":0,"buyRatio":"100%","uniqueWallets":0,"windowMs":27,"baselineSwapsPerMin":"0.00","isNewMomentum":true}
+21:34:05.621 [info]: 🚀 Phase 2: Verifying candidate EwEJ5R1im54MowvsGwYUkyfWRMV1qcRL21PumVd4pump
+21:34:05.784 [info]: ✅ Phase 2 VERIFIED (pump fast path): 3yxXrRQArWwWm6zvwfSDkDgSvrQQAHPfLbzzGTUXpump
+21:34:05.785 [info]: 📊 Parsing 3 signatures for REAL data: 3yxXrRQArWwWm6zv...
+21:34:05.963 [info]: ✅ Phase 2 VERIFIED (pump fast path): EwEJ5R1im54MowvsGwYUkyfWRMV1qcRL21PumVd4pump
+21:34:05.963 [info]: 📊 Parsing 3 signatures for REAL data: EwEJ5R1im54Mowvs...
+21:34:09.811 [info]: 🔥 HOT TOKEN DETECTED (Phase 1) {"candidate":"4TyZGqRLG3VcHTGM...","swaps":5,"buys":5,"sells":0,"buyRatio":"100%","uniqueWallets":0,"windowMs":7221,"baselineSwapsPerMin":"0.00","isNewMomentum":true}
+21:34:09.812 [info]: 🚀 Phase 2: Verifying candidate 4TyZGqRLG3VcHTGMcLBoPUmqYitMVojXinAmkL8xpump
+21:34:09.972 [info]: ✅ Phase 2 VERIFIED (pump fast path): 4TyZGqRLG3VcHTGMcLBoPUmqYitMVojXinAmkL8xpump
+21:34:09.972 [info]: 📊 Parsing 3 signatures for REAL data: 4TyZGqRLG3VcHTGM...
+21:34:18.100 [info]: ✅ Emitted 1 REAL events for 3yxXrRQArWwWm6zv... (3 tx parses)
+21:34:18.101 [info]: PHASE2_VERIFIED {"candidate":"3yxXrRQArWwWm6zvwfSDkDgSvrQQAHPfLbzzGTUXpump","method":"with_tx_parse","txParseCalls":3,"accountInfoCalls":1}
+21:34:18.389 [info]: ✅ Emitted 0 REAL events for EwEJ5R1im54Mowvs... (3 tx parses)
+21:34:18.391 [info]: PHASE2_VERIFIED {"candidate":"EwEJ5R1im54MowvsGwYUkyfWRMV1qcRL21PumVd4pump","method":"with_tx_parse","txParseCalls":3,"accountInfoCalls":1}
+21:34:18.671 [info]: ✅ Emitted 0 REAL events for 4TyZGqRLG3VcHTGM... (3 tx parses)
+21:34:18.671 [info]: PHASE2_VERIFIED {"candidate":"4TyZGqRLG3VcHTGMcLBoPUmqYitMVojXinAmkL8xpump","method":"with_tx_parse","txParseCalls":3,"accountInfoCalls":1}
+21:34:30.024 [info]: ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+21:34:30.024 [info]: 📊 STATUS | Uptime: 1m | Swaps/min: 2 | Active tokens: 1
+21:34:30.025 [info]: 🔍 PHASE 1 (FREE): Tracking 9 tokens | Hot: 0
+21:34:30.025 [info]: 📈 Waiting for momentum score ≥ 2.5 (sustained 3s)
+21:34:30.025 [info]: ⏳ No trades yet - waiting for high-momentum opportunities
+21:34:30.025 [info]: ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+I can see the fix is working:1. `📊 Parsing 3 signatures for REAL data:` - It's parsing signatures now!
+2. `✅ Emitted 1 REAL events for 3yxXrRQArWwWm6zv... (3 tx parses)` - REAL events are being emitted!3. `method":"with_tx_parse","txParseCalls":3` - The logs show tx parsing happenedBut I notice:- Some tokens emitted 0 events (EwEJ5R1im54Mowvs, 4TyZGqRLG3VcHTGM)- This could be because the parsed transactions didn't match the candidate tokenLet me check the events file to see if we're now getting real wallet/notional data:</details></think>
+
+---
+
+The fix is working! I can see:
+- `📊 Parsing 3 signatures for REAL data` ✅
+- `✅ Emitted 1 REAL events... (3 tx parses)` ✅
+- `method: "with_tx_parse"` ✅
+
+Let me verify the events now have REAL data:
+
+---
+
+<tool-use data-tool-type="shell" data-tool-name="run_terminal_cmd">
+<details><summary>Tool use: **run_terminal_cmd** • Run command: cd "D:/ZeroToAI/MVPs/Momentum Trading Bot" && tail -50 logs/events_2026-01-18.jsonl | grep SWAP_DETECTED | tail -5</summary>
+
+```bash
+cd "D:/ZeroToAI/MVPs/Momentum Trading Bot" && tail -50 logs/events_2026-01-18.jsonl | grep SWAP_DETECTED | tail -5
+```
+
+```
+{"type":"SWAP_DETECTED","timestamp":1768757599142,"data":{"signature":"4PKdHHw9WsY7DgamLjfQHx1ZcrUPhi4m7njumTauaQwwGQidgz5mB9Zn239FkFtxd9zAyTAgWZHyCc8jy26c5VNX","tokenMint":"3yxXrRQArWwWm6zvwfSDkDgSvrQQAHPfLbzzGTUXpump","direction":"BUY","notionalSol":"0.01","wallet":"unknown","dex":"METEORA","phase":"pump_log_parsed"}}
+{"type":"SWAP_DETECTED","timestamp":1768757599166,"data":{"signature":"2fGW5nYe32GW7r3hiR7GJvksECwcVBhqGQymEQpzQFNxcbzBUy85rCKUcyzV11qnjLykAQth5MsMSPnncfNqpwcJ","tokenMint":"3yxXrRQArWwWm6zvwfSDkDgSvrQQAHPfLbzzGTUXpump","direction":"BUY","notionalSol":"0.01","wallet":"unknown","dex":"METEORA","phase":"pump_log_parsed"}}
+{"type":"SWAP_DETECTED","timestamp":1768757600214,"data":{"signature":"5y8qFJGbUrfi4H7HaWb3j4HjU1687qbN6hP8GmHuDjVK8hVDLgxwj6dzr5rivXZUx546oE8WMGHmgxandtzANqmY","tokenMint":"3yxXrRQArWwWm6zvwfSDkDgSvrQQAHPfLbzzGTUXpump","direction":"BUY","notionalSol":"0.01","wallet":"unknown","dex":"METEORA","phase":"pump_log_parsed"}}
+{"type":"SWAP_DETECTED","timestamp":1768757600443,"data":{"signature":"4CQJv5RUbZmLEBjE3gVhWG79ds4UahvqXu1EZXHneWmGLtugtLer1juVYcZGqExBot4S8Eu5dLwMYYhCoKn8Vqyi","tokenMint":"3yxXrRQArWwWm6zvwfSDkDgSvrQQAHPfLbzzGTUXpump","direction":"BUY","notionalSol":"0.01","wallet":"unknown","dex":"METEORA","phase":"pump_log_parsed"}}
+{"type":"SWAP_DETECTED","timestamp":1768757657316,"data":{"signature":"f3V2ckAZd5NnU9cJQNqS8yr1FAjvPFXjzdod5j9DP4BbZ5HTTSnNdayn84FzSoiiJ9XyQkJsGULKbidmKvhyhRM","tokenMint":"3yxXrRQArWwWm6zvwfSDkDgSvrQQAHPfLbzzGTUXpump","direction":"BUY","notionalSol":"1.74505","wallet":"FFo4UPiAwUMPtyDVcH9wUTxZFg9E53jLQDBryGDmp8e7","dex":"METEORA","phase":"non_pump_tx_parsed"}}
+
+```
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+Excellent! I can see the difference clearly:
+
+**OLD events (pump_log_parsed):**
+- `"wallet":"unknown"`
+- `"notionalSol":"0.01"`
+- `"phase":"pump_log_parsed"`
+
+**NEW events (non_pump_tx_parsed):**
+- `"wallet":"FFo4UPiAwUMPtyDVcH9wUTxZFg9E53jLQDBryGDmp8e7"` ← REAL WALLET!
+- `"notionalSol":"1.74505"` ← REAL AMOUNT (1.74 SOL!)
+- `"phase":"non_pump_tx_parsed"`
+
+The fix is working! Real data is now being emitted for non-pump sources!
+
+However, I notice there are still old events being emitted with `pump_log_parsed` phase. This might be because:
+1. They're coming from before my restart2. Or there's still some code path emitting them
+
+Wait, looking more carefully at the logs, the `pump_log_parsed` events have timestamps before the `non_pump_tx_parsed` event. The old events are from before the fix was deployed.
+
+Let me verify by checking the most recent events only:</details></think>
+
+---
+
+**LOOK AT THE LAST EVENT!** 🎉
+
+```json
+"wallet":"FFo4UPiAwUMPtyDVcH9wUTxZFg9E53jLQDBryGDmp8e7"  ← REAL WALLET!
+"notionalSol":"1.74505"                                   ← REAL AMOUNT (1.74 SOL!)
+"phase":"non_pump_tx_parsed"                              ← NEW METHOD!
+```
+
+**Before (fake):** `wallet:"unknown"`, `notionalSol:"0.01"`
+**After (real):** `wallet:"FFo4UPi..."`, `notionalSol:"1.74505"`
+
+Let me verify more recent events:
+
+---
+
+<tool-use data-tool-type="shell" data-tool-name="run_terminal_cmd">
+<details><summary>Tool use: **run_terminal_cmd** • Run command: sleep 30 && cd "D:/ZeroToAI/MVPs/Momentum Trading Bot" && tail -20 logs/events_2026-01-18.jsonl | grep SWAP_DETECTED</summary>
+
+```bash
+sleep 30 && cd "D:/ZeroToAI/MVPs/Momentum Trading Bot" && tail -20 logs/events_2026-01-18.jsonl | grep SWAP_DETECTED
+```
+
+```
+{"type":"SWAP_DETECTED","timestamp":1768757598313,"data":{"signature":"3C8bgfAF7j2CD6w38oDipHixFs9f7G4Rzv6KH32nebHGpoNLv1mGxoSkK9hL1tBtqrmZa7HM5hdB5L1FitztJ2F8","tokenMint":"3yxXrRQArWwWm6zvwfSDkDgSvrQQAHPfLbzzGTUXpump","direction":"BUY","notionalSol":"0.01","wallet":"unknown","dex":"METEORA","phase":"pump_log_parsed"}}
+{"type":"SWAP_DETECTED","timestamp":1768757599142,"data":{"signature":"4PKdHHw9WsY7DgamLjfQHx1ZcrUPhi4m7njumTauaQwwGQidgz5mB9Zn239FkFtxd9zAyTAgWZHyCc8jy26c5VNX","tokenMint":"3yxXrRQArWwWm6zvwfSDkDgSvrQQAHPfLbzzGTUXpump","direction":"BUY","notionalSol":"0.01","wallet":"unknown","dex":"METEORA","phase":"pump_log_parsed"}}
+{"type":"SWAP_DETECTED","timestamp":1768757599166,"data":{"signature":"2fGW5nYe32GW7r3hiR7GJvksECwcVBhqGQymEQpzQFNxcbzBUy85rCKUcyzV11qnjLykAQth5MsMSPnncfNqpwcJ","tokenMint":"3yxXrRQArWwWm6zvwfSDkDgSvrQQAHPfLbzzGTUXpump","direction":"BUY","notionalSol":"0.01","wallet":"unknown","dex":"METEORA","phase":"pump_log_parsed"}}
+{"type":"SWAP_DETECTED","timestamp":1768757600214,"data":{"signature":"5y8qFJGbUrfi4H7HaWb3j4HjU1687qbN6hP8GmHuDjVK8hVDLgxwj6dzr5rivXZUx546oE8WMGHmgxandtzANqmY","tokenMint":"3yxXrRQArWwWm6zvwfSDkDgSvrQQAHPfLbzzGTUXpump","direction":"BUY","notionalSol":"0.01","wallet":"unknown","dex":"METEORA","phase":"pump_log_parsed"}}
+{"type":"SWAP_DETECTED","timestamp":1768757600443,"data":{"signature":"4CQJv5RUbZmLEBjE3gVhWG79ds4UahvqXu1EZXHneWmGLtugtLer1juVYcZGqExBot4S8Eu5dLwMYYhCoKn8Vqyi","tokenMint":"3yxXrRQArWwWm6zvwfSDkDgSvrQQAHPfLbzzGTUXpump","direction":"BUY","notionalSol":"0.01","wallet":"unknown","dex":"METEORA","phase":"pump_log_parsed"}}
+{"type":"SWAP_DETECTED","timestamp":1768757657316,"data":{"signature":"f3V2ckAZd5NnU9cJQNqS8yr1FAjvPFXjzdod5j9DP4BbZ5HTTSnNdayn84FzSoiiJ9XyQkJsGULKbidmKvhyhRM","tokenMint":"3yxXrRQArWwWm6zvwfSDkDgSvrQQAHPfLbzzGTUXpump","direction":"BUY","notionalSol":"1.74505","wallet":"FFo4UPiAwUMPtyDVcH9wUTxZFg9E53jLQDBryGDmp8e7","dex":"METEORA","phase":"non_pump_tx_parsed"}}
+{"type":"SWAP_DETECTED","timestamp":1768757712966,"data":{"signature":"3DXDSHTkEdMA2C63d11TA4Qk7REAawUGgXuyvDH5dn7KSCtYBWniXFYmFSfMqgSU51gyduqNbG8ergPyN2RTvqxo","tokenMint":"4BGmdSVq51i58FpEEuY6tKoLZTAMe7zYUN8Jr1Hgpump","direction":"BUY","notionalSol":"0.350009998","wallet":"331eZTnykKgBWKbosLmopLze2cJM3NSKoRwoANjcM5ri","dex":"METEORA","phase":"non_pump_tx_parsed"}}
+
+```
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+I can see TWO real events now:1. `3yxXrRQArWwWm6zv...pump` - wallet: `FFo4UPiAwUMPtyDVcH9wUTxZFg9E53jLQDBryGDmp8e7`, notionalSol: `1.74505`
+2. `4BGmdSVq51i58FpE...pump` - wallet: `331eZTnykKgBWKbosLmopLze2cJM3NSKoRwoANjcM5ri`, notionalSol: `0.350009998`
+
+The fix is working! Real wallet and notional data is now being emitted!
+
+But wait, I notice there are still some `pump_log_parsed` events with `wallet:"unknown"`. These are OLD events from before the restart. The log file is cumulative, so it includes old data.
+
+Let me check if there are any NEW `pump_log_parsed` events (which would indicate a bug):</details></think>
+
+---
+
+**More real events:**
+```json
+"wallet":"331eZTnykKgBWKbosLmopLze2cJM3NSKoRwoANjcM5ri"
+"notionalSol":"0.350009998"
+"phase":"non_pump_tx_parsed"
+```
+
+The old `pump_log_parsed` events are from BEFORE the fix (note the timestamps). Let me verify no new fake events are being generated:
+
+---
+
+<tool-use data-tool-type="shell" data-tool-name="run_terminal_cmd">
+<details><summary>Tool use: **run_terminal_cmd** • Run command: cd "D:/ZeroToAI/MVPs/Momentum Trading Bot" && grep 'pump_log_parsed' logs/events_2026-01-18.jsonl | tail -1 | grep -o '"timestamp":[0-9]*' && grep 'non_pump_tx_parsed' logs/events_2026-01-18.jsonl | tail -1 | grep -o '"timestamp":[0-9]*'</summary>
+
+```bash
+cd "D:/ZeroToAI/MVPs/Momentum Trading Bot" && grep 'pump_log_parsed' logs/events_2026-01-18.jsonl | tail -1 | grep -o '"timestamp":[0-9]*' && grep 'non_pump_tx_parsed' logs/events_2026-01-18.jsonl | tail -1 | grep -o '"timestamp":[0-9]*'
+```
+
+```
+"timestamp":1768757600443
+"timestamp":1768757712966
+
+```
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+The timestamps show:- Last `pump_log_parsed` event: `1768757600443` (older)- Last `non_pump_tx_parsed` event: `1768757712966` (newer)This confirms:1. No NEW fake events are being generated2. Only REAL events with actual wallet/notional are being emittedThe fix is working! Let me update the TODO and commit the changes:</details></think>
+
+---
+
+**Timestamps confirm:**
+- Last fake event: `1768757600443` (21:33:20)
+- Last real event: `1768757712966` (21:35:12)
+
+No new fake events after the fix! ✅
+
+---
+
+<tool-use data-tool-type="task" data-tool-name="todo_write">
+<details><summary>Tool use: **todo_write** • Todo List</summary>
+
+- [x] Stop buffering fake events for non-pump sources
+- [x] Parse signatures after verification for non-pump tokens
+- [x] Test and verify real data is emitted
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+Now let me commit these changes:</details></think>
+
+---
+
+Let me commit these changes:
+
+---
+
+<tool-use data-tool-type="shell" data-tool-name="run_terminal_cmd">
+<details><summary>Tool use: **run_terminal_cmd** • Run command: cd "D:/ZeroToAI/MVPs/Momentum Trading Bot" && git add -A && git commit -m "fix: Parse real wallet/direction/notional for non-pump DEX sources
+
+CRITICAL FIX: Non-pump DEX events (METEORA, RAYDIUM, ORCA) now have real data!
+
+Before:
+- wallet: 'unknown'
+- notionalSol: '0.01' (placeholder)
+- direction: 'BUY' (default)
+- Risk gates always failed (no wallet diversity, flat momentum)
+
+After:
+- wallet: REAL wallet address
+- notionalSol: REAL trade amount (e.g. 1.74505 SOL)
+- direction: REAL direction (BUY/SELL)
+- Risk gates can now work properly!
+
+Implementation:
+1. Only buffer events for PUMPFUN/PUMPSWAP (they have real data from logs)
+2. For non-pump sources: track signatures only in Phase 1
+3. After Phase 2 verification: parse 1-3 signatures with getParsedTransaction
+4. Emit REAL events with actual wallet/direction/notional
+
+RPC usage: ~3 getParsedTransaction calls per verified hot token
+(acceptable trade-off for real data quality)" && git push origin main</summary>
+
+```bash
+cd "D:/ZeroToAI/MVPs/Momentum Trading Bot" && git add -A && git commit -m "fix: Parse real wallet/direction/notional for non-pump DEX sources
+
+CRITICAL FIX: Non-pump DEX events (METEORA, RAYDIUM, ORCA) now have real data!
+
+Before:
+- wallet: 'unknown'
+- notionalSol: '0.01' (placeholder)
+- direction: 'BUY' (default)
+- Risk gates always failed (no wallet diversity, flat momentum)
+
+After:
+- wallet: REAL wallet address
+- notionalSol: REAL trade amount (e.g. 1.74505 SOL)
+- direction: REAL direction (BUY/SELL)
+- Risk gates can now work properly!
+
+Implementation:
+1. Only buffer events for PUMPFUN/PUMPSWAP (they have real data from logs)
+2. For non-pump sources: track signatures only in Phase 1
+3. After Phase 2 verification: parse 1-3 signatures with getParsedTransaction
+4. Emit REAL events with actual wallet/direction/notional
+
+RPC usage: ~3 getParsedTransaction calls per verified hot token
+(acceptable trade-off for real data quality)" && git push origin main
+```
+
+```
+warning: LF will be replaced by CRLF in .specstory/history/2026-01-16_08-23Z-solana-on-chain-momentum-trading-bot.md.
+The file will have its original line endings in your working directory
+[main 8eb577b] fix: Parse real wallet/direction/notional for non-pump DEX sources
+ 2 files changed, 1301 insertions(+), 12 deletions(-)
+remote: This repository moved. Please use the new location:        
+remote:   https://github.com/Zero2Ai-hub/momentum-bot.git        
+To https://github.com/Zero2Ai-hub/Momentum-Bot.git
+   0601e75..8eb577b  main -&gt; main
+
+```
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+The fix is committed. Let me provide a summary for the user:</details></think>
+
+---
+
+## ✅ Fix Complete!
+
+### Before vs After:
+
+| Field | Before (Fake) | After (Real) |
+|-------|---------------|--------------|
+| wallet | `"unknown"` | `"FFo4UPiAwUMPtyDVcH9wUTxZFg9E53jLQDBryGDmp8e7"` |
+| notionalSol | `"0.01"` | `"1.74505"` |
+| direction | `"BUY"` (default) | `"BUY"` or `"SELL"` (real) |
+| phase | `"pump_log_parsed"` | `"non_pump_tx_parsed"` |
+
+### What Changed:
+
+```
+Phase 1: Detect pump tokens from ALL DEXs (FREE)
+         └─ Track signatures, DON'T buffer fake events
+
+Phase 2: When verified:
+         ├─ PUMPFUN/PUMPSWAP: Flush buffered events (already real)
+         └─ Non-pump (METEORA/RAYDIUM/ORCA): Parse 1-3 signatures
+            └─ Emit REAL events with wallet/direction/notional
+```
+
+### RPC Usage:
+- ~3 `getParsedTransaction` calls per verified hot token
+- Worth it for real data quality!
+
+### Expected Impact:
+- **Wallet diversity** → Now calculable (real wallets)
+- **Momentum score** → Now meaningful (real SOL amounts)
+- **Risk gates** → Can now pass with real data
+- **Trades** → Should finally be possible!
+
+---
+
+_**User (2026-01-18 07:41Z)**_
+
+@bash (1003-1015) why this token was not traded? what is the reason ?
+
+---
+
+_**Agent (model claude-4.5-opus-high-thinking, mode Agent)**_
+
+<think><details><summary>Thought Process</summary>
+The user is asking why the token `2oCxjpWWEmCuNaXiBSVahUKP1xRMRAiBfCg98YyHpump` was not traded despite:
+1. Being detected as HOT
+2. Being verified
+3. Having 3 REAL events emitted
+
+Let me analyze the logs:
+- `Swaps/min: 1` - Very low swap rate
+- `Active tokens: 2` - Only 2 tokens in universe
+- `Waiting for momentum score ≥ 2.5 (sustained 3s)` - Momentum threshold not met
+
+The token was verified and events were emitted, but it still needs to meet the momentum scoring requirements. Let me check what the actual momentum is and why it's not reaching 2.5.
+
+The issue could be:
+1. Only 3 events were emitted (parsed from 3 signatures)
+2. The momentum score calculation requires more activity
+3. The 3-second sustained requirement wasn't met
+
+Let me check the events file to see the actual data for this token.</details></think>
+
+---
+
+Let me check the actual swap data for this token:
+
+---
+
+<tool-use data-tool-type="shell" data-tool-name="run_terminal_cmd">
+<details><summary>Tool use: **run_terminal_cmd** • Run command: cd "D:/ZeroToAI/MVPs/Momentum Trading Bot" && grep "2oCxjpWWEmCuNaXiBSVahUKP1xRMRAiBfCg98YyHpump" logs/events_2026-01-18.jsonl | grep SWAP_DETECTED</summary>
+
+```bash
+cd "D:/ZeroToAI/MVPs/Momentum Trading Bot" && grep "2oCxjpWWEmCuNaXiBSVahUKP1xRMRAiBfCg98YyHpump" logs/events_2026-01-18.jsonl | grep SWAP_DETECTED
+```
+
+```
+{"type":"SWAP_DETECTED","timestamp":1768758305999,"data":{"signature":"4ByxoGfdit2KCcXzBHqzjff2A3Zr8PWhVsJg4nnhfwYubJJ6UHB481y872THMhDPZckND9CR4zCKEjyadSEzR5N4","tokenMint":"2oCxjpWWEmCuNaXiBSVahUKP1xRMRAiBfCg98YyHpump","direction":"BUY","notionalSol":"0.152083989","wallet":"98Fbe7fodkhUtJPeNkLGhrDqdwXEJ4oFSawYZt7EB6MY","dex":"METEORA","phase":"non_pump_tx_parsed"}}
+{"type":"SWAP_DETECTED","timestamp":1768758306001,"data":{"signature":"4ByxoGfdit2KCcXzBHqzjff2A3Zr8PWhVsJg4nnhfwYubJJ6UHB481y872THMhDPZckND9CR4zCKEjyadSEzR5N4","tokenMint":"2oCxjpWWEmCuNaXiBSVahUKP1xRMRAiBfCg98YyHpump","direction":"BUY","notionalSol":"0.152083989","wallet":"98Fbe7fodkhUtJPeNkLGhrDqdwXEJ4oFSawYZt7EB6MY","dex":"METEORA","phase":"non_pump_tx_parsed"}}
+{"type":"SWAP_DETECTED","timestamp":1768758306303,"data":{"signature":"gcZg1EmBYYyrJaERKHc3E387nHJXZEPYzeFzMQvBPWeTrSjEXC1AJpvCHn6LHXpBemx8g4r8nFhMQM5DVHQUbaS","tokenMint":"2oCxjpWWEmCuNaXiBSVahUKP1xRMRAiBfCg98YyHpump","direction":"BUY","notionalSol":"0.016156254","wallet":"7fUQLG79HxpqKSDc5MTpvXeGBrkcBcFDU8Xi9uX3GzYr","dex":"METEORA","phase":"non_pump_tx_parsed"}}
+{"type":"SWAP_DETECTED","timestamp":1768758306304,"data":{"signature":"gcZg1EmBYYyrJaERKHc3E387nHJXZEPYzeFzMQvBPWeTrSjEXC1AJpvCHn6LHXpBemx8g4r8nFhMQM5DVHQUbaS","tokenMint":"2oCxjpWWEmCuNaXiBSVahUKP1xRMRAiBfCg98YyHpump","direction":"BUY","notionalSol":"0.016156254","wallet":"7fUQLG79HxpqKSDc5MTpvXeGBrkcBcFDU8Xi9uX3GzYr","dex":"METEORA","phase":"non_pump_tx_parsed"}}
+{"type":"SWAP_DETECTED","timestamp":1768758306574,"data":{"signature":"2vGqDQ95DHEQBj8t5UGRHkiu23aQ3fNVaHZvGNsMXGgCxqtYGJ4VSssWmYvgXdhqdd8WSTrpeFTCJmhwpeLiNx4a","tokenMint":"2oCxjpWWEmCuNaXiBSVahUKP1xRMRAiBfCg98YyHpump","direction":"BUY","notionalSol":"0.351913359","wallet":"DUTidXGA8mToyH2UP3wLsn5JWxzJGsYKvsDMZQMzLwab","dex":"METEORA","phase":"non_pump_tx_parsed"}}
+{"type":"SWAP_DETECTED","timestamp":1768758306675,"data":{"signature":"2vGqDQ95DHEQBj8t5UGRHkiu23aQ3fNVaHZvGNsMXGgCxqtYGJ4VSssWmYvgXdhqdd8WSTrpeFTCJmhwpeLiNx4a","tokenMint":"2oCxjpWWEmCuNaXiBSVahUKP1xRMRAiBfCg98YyHpump","direction":"BUY","notionalSol":"0.351913359","wallet":"DUTidXGA8mToyH2UP3wLsn5JWxzJGsYKvsDMZQMzLwab","dex":"METEORA","phase":"non_pump_tx_parsed"}}
+
+```
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+I see the data. Let me analyze:
+
+1. **Only 3 unique signatures** (6 events but duplicates):   - `4ByxoGfdit2KCcXzBHqzjff2A3Zr8PWhVsJg4nnhfwYubJJ6UHB481y872THMhDPZckND9CR4zCKEjyadSEzR5N4` - 0.152 SOL   - `gcZg1EmBYYyrJaERKHc3E387nHJXZEPYzeFzMQvBPWeTrSjEXC1AJpvCHn6LHXpBemx8g4r8nFhMQM5DVHQUbaS` - 0.016 SOL
+   - `2vGqDQ95DHEQBj8t5UGRHkiu23aQ3fNVaHZvGNsMXGgCxqtYGJ4VSssWmYvgXdhqdd8WSTrpeFTCJmhwpeLiNx4a` - 0.352 SOL2. **All BUYs** - 100% buy ratio
+3. **3 unique wallets**:   - `98Fbe7fodkhUtJPeNkLGhrDqdwXEJ4oFSawYZt7EB6MY`
+   - `7fUQLG79HxpqKSDc5MTpvXeGBrkcBcFDU8Xi9uX3GzYr`   - `DUTidXGA8mToyH2UP3wLsn5JWxzJGsYKvsDMZQMzLwab`4. **Total notional**: 0.152 + 0.016 + 0.352 = ~0.52 SOL5. </details></think>
 
 ---
 

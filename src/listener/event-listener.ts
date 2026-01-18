@@ -95,6 +95,9 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
   private verifiedMints = new Set<string>();
   private rejectedMints = new Set<string>();
   
+  // Emitted signatures cache (prevent duplicate event emission)
+  private emittedSignatures = new Set<string>();
+  
   // RPC counters
   private rpcCounters: RpcCounters = {
     getParsedTransaction: 0,
@@ -420,6 +423,11 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
    * Emit a pump event directly (no tx parsing - P0-4)
    */
   private emitPumpEvent(candidate: Phase1Candidate): void {
+    // DEDUPE: Skip if we already emitted this signature
+    if (this.emittedSignatures.has(candidate.signature)) {
+      return;
+    }
+    
     const event: SwapEvent = {
       signature: candidate.signature,
       slot: 0,
@@ -439,6 +447,9 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     );
     
     if (!validation.valid) return;
+    
+    // Mark as emitted to prevent duplicates
+    this.emittedSignatures.add(candidate.signature);
     
     // Log and emit
     logEvent(LogEventType.SWAP_DETECTED, {
@@ -625,6 +636,11 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
         
         // Only emit if this event is for our candidate token
         if (event && event.tokenMint === candidate) {
+          // DEDUPE: Skip if we already emitted this signature
+          if (this.emittedSignatures.has(event.signature)) {
+            continue;
+          }
+          
           const validation = validateSwapEvent(
             event.tokenMint,
             event.walletAddress,
@@ -632,6 +648,9 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
           );
           
           if (validation.valid) {
+            // Mark as emitted to prevent duplicates
+            this.emittedSignatures.add(event.signature);
+            
             logEvent(LogEventType.SWAP_DETECTED, {
               signature: event.signature,
               tokenMint: event.tokenMint,
@@ -666,6 +685,11 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     log.debug(`Flushing ${events.length} buffered pump events for ${mint.slice(0, 16)}...`);
     
     for (const event of events) {
+      // DEDUPE: Skip if we already emitted this signature
+      if (this.emittedSignatures.has(event.signature)) {
+        continue;
+      }
+      
       const validation = validateSwapEvent(
         event.tokenMint,
         event.walletAddress,
@@ -673,6 +697,9 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
       );
       
       if (validation.valid) {
+        // Mark as emitted to prevent duplicates
+        this.emittedSignatures.add(event.signature);
+        
         logEvent(LogEventType.SWAP_DETECTED, {
           signature: event.signature,
           tokenMint: event.tokenMint,
@@ -818,6 +845,15 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
         this.recentSignatures.add(sig);
       }
       log.debug(`Cleaned up signatures, ${this.recentSignatures.size} remaining`);
+    }
+    
+    // Cleanup emitted signatures cache
+    if (this.emittedSignatures.size > this.maxSignatures) {
+      const toKeep = Array.from(this.emittedSignatures).slice(-this.maxSignatures / 2);
+      this.emittedSignatures.clear();
+      for (const sig of toKeep) {
+        this.emittedSignatures.add(sig);
+      }
     }
     
     // Cleanup verified/rejected caches
