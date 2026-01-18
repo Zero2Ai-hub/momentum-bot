@@ -283,13 +283,14 @@ export function isValidTokenMint(address: string): boolean {
  * Check if a wallet address is valid for a real user trade
  */
 export function isValidWalletAddress(address: string): boolean {
-  // Solana addresses are 32 bytes = exactly 43-44 characters in base58
-  if (address.length < 43 || address.length > 44) {
-    return false;
+  // "unknown" is allowed - we may not be able to extract wallet from all DEX logs
+  // This is fine because the token validation is the critical part
+  if (address === 'unknown') {
+    return true;  // Allow unknown wallets
   }
   
-  // Must not be "unknown"
-  if (address === 'unknown') {
+  // Solana addresses are 32 bytes = exactly 43-44 characters in base58
+  if (address.length < 43 || address.length > 44) {
     return false;
   }
   

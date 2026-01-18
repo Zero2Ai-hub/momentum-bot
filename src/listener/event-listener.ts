@@ -270,12 +270,10 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
         candidate.wallet
       );
       
-      // Buffer pump events for later emission (no tx parsing needed)
-      // For pump sources, we have full event data
-      // For non-pump sources, we'll need Phase 2 to get full data
-      if (candidate.isPumpSource) {
-        this.bufferPumpEvent(candidate);
-      }
+      // Buffer ALL pump token events for emission after verification
+      // Whether from PUMPFUN/PUMPSWAP or other DEXs (METEORA, RAYDIUM, etc.)
+      // All tokens ending with "pump" are pump.fun tokens!
+      this.bufferPumpEvent(candidate);
     }
   }
   
