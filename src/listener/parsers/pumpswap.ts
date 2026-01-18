@@ -68,57 +68,9 @@ function isLikelyTokenMint(address: string): boolean {
 }
 
 /**
- * Parse PumpSwap logs into SwapEvent objects.
+ * Parse PumpSwap-specific log format (internal helper)
  */
-export function parsePumpSwap(
-  signature: string,
-  slot: number,
-  logs: string[]
-): SwapEvent[] {
-  const events: SwapEvent[] = [];
-  
-  // Check if this is a swap transaction
-  const hasSwapInstruction = logs.some(log => SWAP_INSTRUCTION_PATTERN.test(log));
-  if (!hasSwapInstruction) {
-    return events;
-  }
-  
-  // Determine direction from instruction type
-  const isBuy = logs.some(log => BUY_PATTERN.test(log));
-  const isSell = logs.some(log => SELL_PATTERN.test(log));
-  
-  // Parse the swap data from logs
-  const parsed = parsePumpSwapLogs(logs, isBuy, isSell);
-  
-  // STRICT: Only emit if we have valid data
-  if (parsed && 
-      parsed.tokenMint && 
-      parsed.walletAddress &&
-      parsed.walletAddress !== 'unknown' &&
-      parsed.walletAddress !== parsed.tokenMint &&
-      !isInfrastructure(parsed.walletAddress) &&
-      parsed.notionalSol.gt(0) &&
-      parsed.notionalSol.lt(1000)) {
-    events.push({
-      signature,
-      slot,
-      timestamp: Date.now(),
-      tokenMint: parsed.tokenMint,
-      direction: parsed.direction,
-      notionalSol: parsed.notionalSol,
-      walletAddress: parsed.walletAddress,
-      dexSource: DEXSource.PUMPSWAP,
-      poolAddress: parsed.poolAddress || undefined,
-    });
-  }
-  
-  return events;
-}
-
-/**
- * Parse PumpSwap-specific log format
- */
-function parsePumpSwapLogs(
+function parsePumpSwapLogsInternal(
   logs: string[],
   isBuy: boolean,
   isSell: boolean
@@ -140,46 +92,46 @@ function parsePumpSwapLogs(
   const amounts: Decimal[] = [];
   
   for (let i = 0; i < logs.length; i++) {
-    const log = logs[i];
+    const logLine = logs[i];
     
     // Skip logs from other programs
-    if (log.includes('Program') && log.includes('invoke') && 
-        !log.includes('pswapRwCM9XkqRitvwZwYnBMu8aHq5W4zT2oM4VaSyg')) {
+    if (logLine.includes('Program') && logLine.includes('invoke') && 
+        !logLine.includes('pswapRwCM9XkqRitvwZwYnBMu8aHq5W4zT2oM4VaSyg')) {
       continue;
     }
     
     // Look for "mint" keyword - strong signal for token mint
-    if (log.toLowerCase().includes('mint') && !log.toLowerCase().includes('amount')) {
-      const mintMatch = log.match(/([1-9A-HJ-NP-Za-km-z]{43,44})/);
+    if (logLine.toLowerCase().includes('mint') && !logLine.toLowerCase().includes('amount')) {
+      const mintMatch = logLine.match(/([1-9A-HJ-NP-Za-km-z]{43,44})/);
       if (mintMatch && isLikelyTokenMint(mintMatch[1])) {
         potentialTokenMints.unshift(mintMatch[1]);
       }
     }
     
     // Look for user/signer patterns
-    if (log.toLowerCase().includes('user') || 
-        log.toLowerCase().includes('signer') ||
-        log.toLowerCase().includes('owner')) {
-      const walletMatch = log.match(/([1-9A-HJ-NP-Za-km-z]{43,44})/);
+    if (logLine.toLowerCase().includes('user') || 
+        logLine.toLowerCase().includes('signer') ||
+        logLine.toLowerCase().includes('owner')) {
+      const walletMatch = logLine.match(/([1-9A-HJ-NP-Za-km-z]{43,44})/);
       if (walletMatch && !isInfrastructure(walletMatch[1])) {
         potentialWallets.push(walletMatch[1]);
       }
     }
     
     // Look for SOL amount patterns
-    const solAmountMatch = log.match(/sol_?amount[:\s]+(\d+)/i);
+    const solAmountMatch = logLine.match(/sol_?amount[:\s]+(\d+)/i);
     if (solAmountMatch) {
       amounts.push(new Decimal(solAmountMatch[1]));
     }
     
-    const lamportsMatch = log.match(/lamports[:\s]+(\d+)/i);
+    const lamportsMatch = logLine.match(/lamports[:\s]+(\d+)/i);
     if (lamportsMatch) {
       amounts.push(new Decimal(lamportsMatch[1]));
     }
     
     // Look for pool address
-    if (log.toLowerCase().includes('pool')) {
-      const poolMatch = log.match(/([1-9A-HJ-NP-Za-km-z]{43,44})/);
+    if (logLine.toLowerCase().includes('pool')) {
+      const poolMatch = logLine.match(/([1-9A-HJ-NP-Za-km-z]{43,44})/);
       if (poolMatch) {
         poolAddress = poolMatch[1];
       }
@@ -188,8 +140,8 @@ function parsePumpSwapLogs(
   
   // Fallback: scan for valid addresses if we didn't find explicit ones
   if (potentialTokenMints.length === 0 || potentialWallets.length === 0) {
-    for (const log of logs) {
-      const addressMatches = log.match(/([1-9A-HJ-NP-Za-km-z]{43,44})/g);
+    for (const logLine of logs) {
+      const addressMatches = logLine.match(/([1-9A-HJ-NP-Za-km-z]{43,44})/g);
       if (addressMatches) {
         for (const addr of addressMatches) {
           if (isLikelyTokenMint(addr)) {
@@ -242,3 +194,54 @@ function parsePumpSwapLogs(
     poolAddress,
   };
 }
+
+/**
+ * Parse PumpSwap logs into SwapEvent objects.
+ */
+export function parsePumpSwapLogs(
+  signature: string,
+  slot: number,
+  logs: string[]
+): SwapEvent[] {
+  const events: SwapEvent[] = [];
+  
+  // Check if this is a swap transaction
+  const hasSwapInstruction = logs.some(logLine => SWAP_INSTRUCTION_PATTERN.test(logLine));
+  if (!hasSwapInstruction) {
+    return events;
+  }
+  
+  // Determine direction from instruction type
+  const isBuy = logs.some(logLine => BUY_PATTERN.test(logLine));
+  const isSell = logs.some(logLine => SELL_PATTERN.test(logLine));
+  
+  // Parse the swap data from logs
+  const parsed = parsePumpSwapLogsInternal(logs, isBuy, isSell);
+  
+  // STRICT: Only emit if we have valid data
+  if (parsed && 
+      parsed.tokenMint && 
+      parsed.walletAddress &&
+      parsed.walletAddress !== 'unknown' &&
+      parsed.walletAddress !== parsed.tokenMint &&
+      !isInfrastructure(parsed.walletAddress) &&
+      parsed.notionalSol.gt(0) &&
+      parsed.notionalSol.lt(1000)) {
+    events.push({
+      signature,
+      slot,
+      timestamp: Date.now(),
+      tokenMint: parsed.tokenMint,
+      direction: parsed.direction,
+      notionalSol: parsed.notionalSol,
+      walletAddress: parsed.walletAddress,
+      dexSource: DEXSource.PUMPSWAP,
+      poolAddress: parsed.poolAddress || undefined,
+    });
+  }
+  
+  return events;
+}
+
+// Backwards compatibility alias
+export const parsePumpSwap = parsePumpSwapLogs;

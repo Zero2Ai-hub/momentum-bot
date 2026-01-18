@@ -75,6 +75,12 @@ export function loadConfig(): BotConfig {
     // Token Universe Management
     tokenInactivityTimeoutMs: optionalNumber('TOKEN_INACTIVITY_TIMEOUT_MS', 120_000), // 2 minutes
     
+    // Two-Phase Detection (credit optimization for Helius Free Plan)
+    // Phase 1: FREE log parsing tracks all swaps
+    // Phase 2: RPC calls only for tokens with hotTokenThreshold swaps in hotTokenWindowMs
+    hotTokenThreshold: optionalNumber('HOT_TOKEN_THRESHOLD', 5), // 5 swaps to trigger RPC
+    hotTokenWindowMs: optionalNumber('HOT_TOKEN_WINDOW_MS', 30_000), // 30 second window
+    
     // Logging
     logLevel: optionalEnv('LOG_LEVEL', 'info'),
     logDir: optionalEnv('LOG_DIR', './logs'),

@@ -2,17 +2,28 @@
  * On-chain Event Listener
  * Subscribes to Solana WebSocket streams and ingests swap events.
  * 
- * FIX: Now blocks swap emission until token mint is verified as a real SPL token.
+ * TWO-PHASE DETECTION:
+ * Phase 1 (FREE): Parse raw logs to track swap count per token
+ * Phase 2 (RPC): Only verify & emit for "hot" tokens with 5+ swaps in 30s
+ * 
+ * This solves:
+ * 1. Credit usage - Only use RPC for hot tokens (~90% savings)
+ * 2. Rate limit blindness - Phase 1 sees ALL activity in real-time
  */
 
 import { Connection, PublicKey } from '@solana/web3.js';
 import EventEmitter from 'eventemitter3';
-import { SwapEvent, DEXSource, DEX_PROGRAM_IDS, LogEventType } from '../types';
+import Decimal from 'decimal.js';
+import { SwapEvent, SwapDirection, DEXSource, DEX_PROGRAM_IDS, LogEventType } from '../types';
 import { getConfig } from '../config/config';
 import { logEvent, log } from '../logging/logger';
-import { validateSwapEvent } from './parsers/known-addresses';
+import { validateSwapEvent, isValidTokenMint } from './parsers/known-addresses';
 import { isValidTradeableToken, initializeTokenVerifier } from './token-verifier';
 import { parseTransactionWithHelius } from './helius-parser';
+import { getHotTokenTracker, HotTokenTracker } from './hot-token-tracker';
+import { parseRaydiumSwap } from './parsers/raydium';
+import { parsePumpFunSwap } from './parsers/pumpfun';
+import { parsePumpSwapLogs } from './parsers/pumpswap';
 
 interface EventListenerEvents {
   'swap': (event: SwapEvent) => void;
@@ -29,6 +40,10 @@ interface SubscriptionHandle {
 /**
  * EventListener manages WebSocket connections to Solana and
  * parses swap events from DEX program logs.
+ * 
+ * Uses TWO-PHASE DETECTION:
+ * - Phase 1: Raw log parsing (FREE) - tracks all swaps
+ * - Phase 2: RPC verification (CREDITS) - only for hot tokens
  */
 export class EventListener extends EventEmitter<EventListenerEvents> {
   private connection: Connection | null = null;
@@ -44,8 +59,16 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
   private signatureCleanupInterval: NodeJS.Timeout | null = null;
   private readonly maxSignatures = 10000;
   
+  // Two-phase detection
+  private hotTokenTracker: HotTokenTracker;
+  private pendingHotTokenVerifications = new Set<string>();
+  
+  // Track signatures per hot token for RPC verification
+  private hotTokenSignatures = new Map<string, Set<string>>();
+  
   constructor() {
     super();
+    this.hotTokenTracker = getHotTokenTracker();
   }
   
   /**
@@ -63,6 +86,10 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     // Initialize token verifier
     await initializeTokenVerifier();
     
+    // Start hot token tracker (Phase 1)
+    this.hotTokenTracker.start();
+    this.hotTokenTracker.onHotToken((tokenMint) => this.handleHotToken(tokenMint));
+    
     // Create HTTP connection for queries
     this.connection = new Connection(config.rpcUrl, 'confirmed');
     
@@ -74,7 +101,7 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
       this.cleanupSignatures();
     }, 30_000);
     
-    log.info('Event listener started');
+    log.info('Event listener started (Two-Phase Detection enabled)');
   }
   
   /**
@@ -86,6 +113,9 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     // Unsubscribe from all
     await this.unsubscribeAll();
     
+    // Stop hot token tracker
+    this.hotTokenTracker.stop();
+    
     // Stop cleanup timer
     if (this.signatureCleanupInterval) {
       clearInterval(this.signatureCleanupInterval);
@@ -93,6 +123,8 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     }
     
     this.recentSignatures.clear();
+    this.hotTokenSignatures.clear();
+    this.pendingHotTokenVerifications.clear();
     log.info('Event listener stopped');
   }
   
@@ -154,6 +186,10 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
   
   /**
    * Handle incoming logs from subscription
+   * 
+   * TWO-PHASE DETECTION:
+   * - Phase 1: Raw log parsing (FREE) - extract token & record activity
+   * - Phase 2: RPC verification (CREDITS) - only when token becomes "hot"
    */
   private handleLogs(
     logs: { signature: string; err: any; logs: string[] },
@@ -169,63 +205,215 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     }
     this.recentSignatures.add(logs.signature);
     
-    // Use Helius parsed transaction API for reliable token extraction
-    this.parseWithHelius(logs.signature, slot, source);
+    // ═══════════════════════════════════════════════════════════════════
+    // PHASE 1: FREE LOG PARSING - Extract basic swap data from raw logs
+    // ═══════════════════════════════════════════════════════════════════
+    const phase1Events = this.parseLogsPhase1(logs.signature, slot, logs.logs, source);
+    
+    for (const event of phase1Events) {
+      // Quick validation before tracking
+      if (!isValidTokenMint(event.tokenMint)) {
+        continue;
+      }
+      
+      // Record in hot token tracker (FREE)
+      this.hotTokenTracker.recordSwap(
+        event.tokenMint,
+        logs.signature,
+        event.isBuy
+      );
+      
+      // Track signature for this token (for Phase 2 verification)
+      if (!this.hotTokenSignatures.has(event.tokenMint)) {
+        this.hotTokenSignatures.set(event.tokenMint, new Set());
+      }
+      this.hotTokenSignatures.get(event.tokenMint)!.add(logs.signature);
+      
+      // Limit stored signatures per token
+      const sigs = this.hotTokenSignatures.get(event.tokenMint)!;
+      if (sigs.size > 20) {
+        const arr = Array.from(sigs);
+        this.hotTokenSignatures.set(event.tokenMint, new Set(arr.slice(-10)));
+      }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // PHASE 2 is triggered when token becomes "hot" (see handleHotToken)
+    // ═══════════════════════════════════════════════════════════════════
   }
   
   /**
-   * Parse transaction using Helius for accurate token mint extraction
-   * 
-   * FIX: Now AWAITS token verification before emitting SWAP_DETECTED.
-   * Only emits if the token mint is verified as a real SPL token mint.
+   * Phase 1: Parse raw logs to extract basic swap data (FREE - no RPC)
    */
-  private async parseWithHelius(
+  private parseLogsPhase1(
     signature: string,
     slot: number,
+    logs: string[],
     source: DEXSource
-  ): Promise<void> {
+  ): Array<{ tokenMint: string; isBuy: boolean }> {
+    const results: Array<{ tokenMint: string; isBuy: boolean }> = [];
+    
+    try {
+      // Try source-specific parsers
+      let events: SwapEvent[] = [];
+      
+      switch (source) {
+        case DEXSource.PUMPFUN:
+          events = parsePumpFunSwap(signature, slot, logs);
+          break;
+        case DEXSource.PUMPSWAP:
+          events = parsePumpSwapLogs(signature, slot, logs);
+          break;
+        case DEXSource.RAYDIUM_V4:
+        case DEXSource.RAYDIUM_CLMM:
+          events = parseRaydiumSwap(signature, slot, logs, source);
+          break;
+        default:
+          // Generic extraction for other DEXs
+          events = this.extractGenericSwap(signature, slot, logs, source);
+      }
+      
+      for (const event of events) {
+        if (event.tokenMint && event.tokenMint !== 'unknown') {
+          results.push({
+            tokenMint: event.tokenMint,
+            isBuy: event.direction === 'BUY',
+          });
+        }
+      }
+    } catch (error) {
+      // Phase 1 errors are non-critical - just skip
+    }
+    
+    return results;
+  }
+  
+  /**
+   * Generic swap extraction for DEXs without specialized parsers
+   */
+  private extractGenericSwap(
+    signature: string,
+    slot: number,
+    logs: string[],
+    source: DEXSource
+  ): SwapEvent[] {
+    const events: SwapEvent[] = [];
+    
+    // Look for swap instruction
+    const hasSwap = logs.some(l => 
+      l.toLowerCase().includes('swap') || 
+      l.toLowerCase().includes('instruction: buy') ||
+      l.toLowerCase().includes('instruction: sell')
+    );
+    
+    if (!hasSwap) return events;
+    
+    // Extract potential token mint addresses
+    const mintPattern = /([1-9A-HJ-NP-Za-km-z]{43,44})/g;
+    const foundMints: string[] = [];
+    
+    for (const log of logs) {
+      const matches = log.match(mintPattern);
+      if (matches) {
+        for (const m of matches) {
+          if (isValidTokenMint(m) && !foundMints.includes(m)) {
+            foundMints.push(m);
+          }
+        }
+      }
+    }
+    
+    // Determine direction
+    const isBuy = logs.some(l => 
+      l.toLowerCase().includes('buy') || 
+      l.toLowerCase().includes('swap') && !l.toLowerCase().includes('sell')
+    );
+    
+    // Return first valid token mint found
+    if (foundMints.length > 0) {
+      events.push({
+        signature,
+        slot,
+        timestamp: Date.now(),
+        tokenMint: foundMints[0],
+        direction: isBuy ? SwapDirection.BUY : SwapDirection.SELL,
+        notionalSol: new Decimal(0), // Unknown in Phase 1
+        walletAddress: 'unknown',
+        dexSource: source,
+      });
+    }
+    
+    return events;
+  }
+  
+  /**
+   * Handle when a token becomes "hot" - trigger Phase 2 RPC verification
+   */
+  private async handleHotToken(tokenMint: string): Promise<void> {
+    // Prevent duplicate verification
+    if (this.pendingHotTokenVerifications.has(tokenMint)) {
+      return;
+    }
+    this.pendingHotTokenVerifications.add(tokenMint);
+    
+    log.info(`🚀 Phase 2: Verifying hot token ${tokenMint}`);
+    
+    try {
+      // Verify token is real SPL mint (uses RPC - CREDITS)
+      const isValid = await isValidTradeableToken(tokenMint);
+      
+      if (!isValid) {
+        log.debug('Hot token rejected - not a valid SPL mint', { tokenMint });
+        return;
+      }
+      
+      // Get stored signatures for this token and verify with RPC
+      const signatures = this.hotTokenSignatures.get(tokenMint);
+      if (!signatures || signatures.size === 0) {
+        log.debug('No signatures stored for hot token', { tokenMint });
+        return;
+      }
+      
+      // Verify recent transactions with full RPC parsing
+      const signatureArr = Array.from(signatures).slice(-5); // Last 5 signatures
+      
+      for (const sig of signatureArr) {
+        await this.verifyAndEmitSwap(sig, tokenMint);
+      }
+      
+    } catch (error) {
+      log.error('Phase 2 verification error', error as Error);
+    } finally {
+      this.pendingHotTokenVerifications.delete(tokenMint);
+    }
+  }
+  
+  /**
+   * Verify a signature and emit swap event if valid (Phase 2)
+   */
+  private async verifyAndEmitSwap(signature: string, expectedMint: string): Promise<void> {
     if (!this.connection) return;
     
     try {
-      const event = await parseTransactionWithHelius(this.connection, signature, slot);
+      const event = await parseTransactionWithHelius(this.connection, signature, 0);
       
-      if (!event) {
-        return; // Not a swap or parsing failed
+      if (!event) return;
+      
+      // Ensure this is for the expected token
+      if (event.tokenMint !== expectedMint) {
+        return;
       }
       
-      // Override DEX source if we detected it from logs
-      if (event.dexSource === DEXSource.UNKNOWN) {
-        event.dexSource = source;
-      }
-      
-      // Basic structural validation (wallet vs mint, notional bounds)
+      // Basic validation
       const validation = validateSwapEvent(
         event.tokenMint,
         event.walletAddress,
         event.notionalSol.toNumber()
       );
       
-      if (!validation.valid) {
-        return;
-      }
+      if (!validation.valid) return;
       
-      // ═══════════════════════════════════════════════════════════════
-      // FIX (P0): BLOCK EMISSION UNTIL MINT IS VERIFIED
-      // ═══════════════════════════════════════════════════════════════
-      // This awaits RPC verification - does NOT emit for unverified mints
-      const isValidMint = await isValidTradeableToken(event.tokenMint);
-      
-      if (!isValidMint) {
-        log.debug('Rejected non-mint address', { 
-          signature: signature.slice(0, 16), 
-          mint: event.tokenMint.slice(0, 16) 
-        });
-        return;
-      }
-      
-      // ═══════════════════════════════════════════════════════════════
-      // VERIFIED: Token mint is a real SPL token - safe to emit
-      // ═══════════════════════════════════════════════════════════════
+      // Emit verified swap event
       logEvent(LogEventType.SWAP_DETECTED, {
         signature: event.signature,
         tokenMint: event.tokenMint,
@@ -233,12 +421,13 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
         notionalSol: event.notionalSol.toString(),
         wallet: event.walletAddress,
         dex: event.dexSource,
+        phase: 'hot_token_verified',
       });
       
       this.emit('swap', event);
       
     } catch (error) {
-      log.debug('Helius parse error', { signature: signature.slice(0, 16), error: (error as Error).message });
+      log.debug('Swap verification failed', { signature: signature.slice(0, 16) });
     }
   }
   
@@ -316,12 +505,17 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     subscriptionCount: number;
     recentSignatureCount: number;
     reconnectAttempts: number;
+    phase1TrackedTokens: number;
+    hotTokens: number;
   } {
+    const hotTokenStats = this.hotTokenTracker.getStats();
     return {
       isRunning: this.isRunning,
       subscriptionCount: this.subscriptions.length,
       recentSignatureCount: this.recentSignatures.size,
       reconnectAttempts: this.reconnectAttempts,
+      phase1TrackedTokens: hotTokenStats.trackedTokens,
+      hotTokens: hotTokenStats.hotTokens,
     };
   }
 }

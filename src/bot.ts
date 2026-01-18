@@ -306,6 +306,7 @@ export class MomentumBot extends EventEmitter<BotEvents> {
     const stats = this.getStats();
     const performance = this.positionManager!.getPerformanceSummary();
     const universeStats = this.tokenUniverse!.getStats();
+    const listenerStats = this.eventListener!.getStats();
     
     // Calculate swaps per minute
     const uptimeMin = stats.uptime / 60000;
@@ -313,7 +314,7 @@ export class MomentumBot extends EventEmitter<BotEvents> {
     
     log.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     log.info(`📊 STATUS | Uptime: ${Math.round(uptimeMin)}m | Swaps/min: ${swapsPerMin} | Active tokens: ${universeStats.totalTokens}`);
-    log.info(`🎯 SCANNING: ALL tokens with DEX activity (Raydium, Orca, Meteora, PumpSwap, Pump.fun)`);
+    log.info(`🔍 PHASE 1 (FREE): Tracking ${listenerStats.phase1TrackedTokens} tokens | Hot: ${listenerStats.hotTokens}`);
     log.info(`📈 Waiting for momentum score ≥ ${this.config.entryThreshold} (sustained ${this.config.confirmationSeconds}s)`);
     
     if (performance.totalTrades > 0) {

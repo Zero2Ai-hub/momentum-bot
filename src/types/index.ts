@@ -269,6 +269,10 @@ export interface BotConfig {
   // Universe
   tokenInactivityTimeoutMs: number;
   
+  // Two-Phase Detection (credit optimization)
+  hotTokenThreshold: number;       // Swaps needed to trigger Phase 2
+  hotTokenWindowMs: number;        // Time window for hot token detection
+  
   // Logging
   logLevel: string;
   logDir: string;
