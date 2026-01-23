@@ -50,7 +50,7 @@ const BLOCKLIST = new Set([
   'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', // Orca Whirlpool
   'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', // Meteora
   '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',  // Pump.fun
-  'pswapRwCM9XkqRitvwZwYnBMu8aHq5W4zT2oM4VaSyg', // PumpSwap
+  'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', // PumpSwap
   
   // Serum/OpenBook
   'srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX',

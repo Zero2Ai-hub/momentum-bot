@@ -244,14 +244,41 @@ export class MomentumBot extends EventEmitter<BotEvents> {
     
     // Only log tokens with REAL momentum (score > 50% of threshold)
     const analytics60s = tokenState.getWindowMetrics('60s');
+    const netInflow = analytics60s.netInflow.toNumber();
+    
+    // FIX: Suppress SELL MOMENTUM - negative net means more selling than buying
+    // This is NOT the momentum we want to trade!
+    const isSellMomentum = netInflow < -0.1; // Allow small negative noise
+    
     if (score.totalScore >= this.config.entryThreshold * 0.5) {
       const pct = ((score.totalScore / this.config.entryThreshold) * 100).toFixed(0);
+      
+      if (isSellMomentum) {
+        // Silently skip sell momentum - don't log (too noisy)
+        return;
+      }
+      
+      // Show buyer count with estimation if known count is low vs swap count
+      // (for graduated tokens where enrichment is slow)
+      const knownBuyers = analytics60s.uniqueBuyers.size;
+      const swapCount = analytics60s.swapCount;
+      const knownBuyerRatio = knownBuyers / Math.max(swapCount, 1);
+      
+      let buyerDisplay: string;
+      if (knownBuyerRatio < 0.1 && swapCount >= 10) {
+        // Very few known buyers relative to swaps - show estimate
+        const estimatedBuyers = Math.max(2, Math.floor(swapCount / 3)); // ~3 swaps per buyer
+        buyerDisplay = `~${estimatedBuyers}*`;
+      } else {
+        buyerDisplay = knownBuyers.toString();
+      }
+      
       // Full token mint for easy lookup on Solscan/Birdeye
-      log.info(`🔥 MOMENTUM: ${tokenState.tokenMint} | ${pct}% | swaps=${analytics60s.swapCount} | buyers=${analytics60s.uniqueBuyers.size} | net=${analytics60s.netInflow.toFixed(3)} SOL`);
+      log.info(`🔥 MOMENTUM: ${tokenState.tokenMint} | ${pct}% | swaps=${swapCount} | buyers=${buyerDisplay} | net=${netInflow.toFixed(3)} SOL`);
     }
     
-    // Check if entry is ready
-    if (this.momentumScorer!.isEntryReady(score)) {
+    // Check if entry is ready - only for BUY momentum
+    if (!isSellMomentum && this.momentumScorer!.isEntryReady(score)) {
       await this.evaluateEntry(tokenState, score);
     }
   }
@@ -283,11 +310,13 @@ export class MomentumBot extends EventEmitter<BotEvents> {
       return;
     }
     
-    // Check wallet balance
-    const canAfford = await this.executionEngine!.canAffordTrade(this.config.tradeSizeSol);
-    if (!canAfford) {
-      log.info(`🚫 REJECTED: ${tokenState.tokenMint.slice(0, 12)}... | Score: ${score.totalScore.toFixed(1)} | Failed: insufficient_balance`);
-      return;
+    // Check wallet balance (skip for paper trading - we simulate anyway)
+    if (!this.config.paperTrading) {
+      const canAfford = await this.executionEngine!.canAffordTrade(this.config.tradeSizeSol);
+      if (!canAfford) {
+        log.info(`🚫 REJECTED: ${tokenState.tokenMint.slice(0, 12)}... | Score: ${score.totalScore.toFixed(1)} | Failed: insufficient_balance`);
+        return;
+      }
     }
     
     // Execute entry

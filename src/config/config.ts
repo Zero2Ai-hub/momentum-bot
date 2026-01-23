@@ -81,6 +81,12 @@ export function loadConfig(): BotConfig {
     hotTokenThreshold: optionalNumber('HOT_TOKEN_THRESHOLD', 5), // 5 swaps to trigger RPC
     hotTokenWindowMs: optionalNumber('HOT_TOKEN_WINDOW_MS', 30_000), // 30 second window
     
+    // Venue Resolution (credit optimization for pump-origin tokens)
+    // When true, checks PumpSwap pool existence before falling back to Raydium parsing
+    preferPumpSwapForPumpMints: optionalEnv('PREFER_PUMPSWAP_FOR_PUMP_MINTS', 'true').toLowerCase() === 'true',
+    // Limit expensive Raydium signature parsing (default 3, was 10)
+    maxRaydiumSignaturesToParse: optionalNumber('MAX_RAYDIUM_SIGNATURES_TO_PARSE', 3),
+    
     // Logging
     logLevel: optionalEnv('LOG_LEVEL', 'info'),
     logDir: optionalEnv('LOG_DIR', './logs'),

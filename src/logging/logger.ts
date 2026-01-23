@@ -16,8 +16,45 @@ function ensureLogDir(logDir: string): void {
   }
 }
 
+// Messages to show in console (patterns)
+const CONSOLE_WHITELIST_PATTERNS = [
+  /🔥 HOT TOKEN DETECTED/,
+  /✅ Token ENTERED universe/,
+  /━━━━━━━━/,  // Status report separator
+  /📊 STATUS/,
+  /🔍 PHASE 1/,
+  /📈 Waiting for momentum/,
+  /💰 TRADES/,
+  /⏳ No trades yet/,
+  /═══.*ENTRY OPPORTUNITY/,
+  /ENTRY_SIGNAL/,
+  /EXIT_SIGNAL/,
+  /POSITION_OPENED/,
+  /POSITION_CLOSED/,
+  /🔥 MOMENTUM:/,
+  /\[PAPER\]/,
+  /TRADE:/,
+  /🔴 FLOW_REVERSAL/,
+  /Momentum Bot/,
+  /PAPER TRADING MODE/,
+  /Bot is now scanning/,
+  /Press Ctrl\+C/,
+  /╔═/,  // Banner
+  /║/,   // Banner  
+  /╚═/,  // Banner
+  /─────/,  // Separator
+];
+
+// Filter for console - only show whitelisted messages
+const consoleFilter = winston.format((info) => {
+  const message = String(info.message || '');
+  const isWhitelisted = CONSOLE_WHITELIST_PATTERNS.some(pattern => pattern.test(message));
+  return isWhitelisted ? info : false;
+});
+
 // Custom format for console output
 const consoleFormat = winston.format.combine(
+  consoleFilter(),
   winston.format.timestamp({ format: 'HH:mm:ss.SSS' }),
   winston.format.colorize(),
   winston.format.printf(({ timestamp, level, message, ...meta }) => {

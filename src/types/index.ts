@@ -235,6 +235,10 @@ export enum LogEventType {
   // RPC tracking
   RPC_COUNTERS = 'RPC_COUNTERS',
   
+  // Venue resolution
+  VENUE_RESOLVE_START = 'VENUE_RESOLVE_START',
+  VENUE_RESOLVE_RESULT = 'VENUE_RESOLVE_RESULT',
+  
   // Errors
   ERROR = 'ERROR',
 }
@@ -296,6 +300,10 @@ export interface BotConfig {
   hotTokenThreshold: number;       // Swaps needed to trigger Phase 2
   hotTokenWindowMs: number;        // Time window for hot token detection
   
+  // Venue Resolution (credit optimization for pump-origin tokens)
+  preferPumpSwapForPumpMints: boolean; // Check PumpSwap first for pump-origin tokens
+  maxRaydiumSignaturesToParse: number; // Limit Raydium parsing (expensive)
+  
   // Logging
   logLevel: string;
   logDir: string;
@@ -322,6 +330,6 @@ export const DEX_PROGRAM_IDS = {
   RAYDIUM_CLMM: 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK',
   ORCA_WHIRLPOOL: 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',
   METEORA: 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo',
-  PUMPSWAP: 'pswapRwCM9XkqRitvwZwYnBMu8aHq5W4zT2oM4VaSyg',
+  PUMPSWAP: 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
   PUMPFUN: '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
 };

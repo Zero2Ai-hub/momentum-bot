@@ -3,12 +3,16 @@
  * Parses swap events from PumpSwap program logs.
  * 
  * PumpSwap is the AMM used by pump.fun for graduated tokens.
- * Program ID: pswapRwCM9XkqRitvwZwYnBMu8aHq5W4zT2oM4VaSyg
+ * Program ID: pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA
+ * 
+ * KEY: Uses IDL-based decoding of "Program data:" for REAL swap data!
+ * BuyEvent and SellEvent give us exact SOL amounts (quote_amount_in/out).
  */
 
 import Decimal from 'decimal.js';
 import { SwapEvent, SwapDirection, DEXSource } from '../../types';
 import { isValidTokenMint, isKnownProgram } from './known-addresses';
+import { parsePumpSwapSwapsFromLogs } from '../pumpswap-idl-parser';
 
 // PumpSwap log patterns
 const SWAP_INSTRUCTION_PATTERN = /Program log: Instruction: (Swap|Buy|Sell)/i;
@@ -17,7 +21,7 @@ const SELL_PATTERN = /Program log: Instruction: Sell/i;
 
 // Known PumpSwap infrastructure addresses
 const PUMPSWAP_INFRASTRUCTURE = new Set([
-  'pswapRwCM9XkqRitvwZwYnBMu8aHq5W4zT2oM4VaSyg',  // PumpSwap program
+  'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',  // PumpSwap program
   'pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ',  // Protocol fee
   'FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9', // Flash protocol
   'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', // Pool authority
@@ -105,7 +109,7 @@ function parsePumpSwapLogsInternal(
     
     // Skip logs from other programs
     if (logLine.includes('Program') && logLine.includes('invoke') && 
-        !logLine.includes('pswapRwCM9XkqRitvwZwYnBMu8aHq5W4zT2oM4VaSyg')) {
+        !logLine.includes('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA')) {
       continue;
     }
     
@@ -206,25 +210,50 @@ function parsePumpSwapLogsInternal(
 
 /**
  * Parse PumpSwap logs into SwapEvent objects.
+ * 
+ * TWO APPROACHES (in order of preference):
+ * 1. IDL-based decoding: Decode BuyEvent/SellEvent from "Program data:" for EXACT SOL amounts
+ * 2. Heuristic fallback: Pattern matching on log strings
  */
 export function parsePumpSwapLogs(
   signature: string,
   slot: number,
   logs: string[]
 ): SwapEvent[] {
-  const events: SwapEvent[] = [];
+  // APPROACH 1: Try IDL-based decoding first (EXACT SOL AMOUNTS!)
+  // This decodes BuyEvent/SellEvent directly from "Program data:" logs
+  const idlEvents = parsePumpSwapSwapsFromLogs(logs, signature, slot);
   
+  if (idlEvents.length > 0) {
+    // Validate and return IDL-decoded events
+    const validEvents: SwapEvent[] = [];
+    for (const event of idlEvents) {
+      // Sanity check
+      if (event.tokenMint && 
+          event.tokenMint.endsWith('pump') &&
+          event.notionalSol.gt(0) &&
+          event.notionalSol.lt(1000)) {
+        validEvents.push(event);
+      }
+    }
+    
+    if (validEvents.length > 0) {
+      return validEvents;
+    }
+  }
+  
+  // APPROACH 2: Fall back to heuristic parsing
   // Check if this is a swap transaction
   const hasSwapInstruction = logs.some(logLine => SWAP_INSTRUCTION_PATTERN.test(logLine));
   if (!hasSwapInstruction) {
-    return events;
+    return [];
   }
   
   // Determine direction from instruction type
   const isBuy = logs.some(logLine => BUY_PATTERN.test(logLine));
   const isSell = logs.some(logLine => SELL_PATTERN.test(logLine));
   
-  // Parse the swap data from logs
+  // Parse the swap data from logs using heuristics
   const parsed = parsePumpSwapLogsInternal(logs, isBuy, isSell);
   
   // STRICT: Only emit if we have valid data
@@ -236,7 +265,7 @@ export function parsePumpSwapLogs(
       !isInfrastructure(parsed.walletAddress) &&
       parsed.notionalSol.gt(0) &&
       parsed.notionalSol.lt(1000)) {
-    events.push({
+    return [{
       signature,
       slot,
       timestamp: Date.now(),
@@ -246,10 +275,10 @@ export function parsePumpSwapLogs(
       walletAddress: parsed.walletAddress,
       dexSource: DEXSource.PUMPSWAP,
       poolAddress: parsed.poolAddress || undefined,
-    });
+    }];
   }
   
-  return events;
+  return [];
 }
 
 // Backwards compatibility alias

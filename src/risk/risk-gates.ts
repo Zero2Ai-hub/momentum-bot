@@ -46,8 +46,8 @@ export class RiskGates {
     const metrics = tokenState.getMetrics();
     const gates: RiskGateResult[] = [];
     
-    // Gate 1: Minimum Liquidity
-    gates.push(this.checkMinimumLiquidity(metrics));
+    // Gate 1: Minimum Liquidity (Phase 1 aware)
+    gates.push(this.checkMinimumLiquidity(metrics, tokenState));
     
     // Gate 2: Wallet Diversity (Phase 1 aware)
     gates.push(this.checkWalletDiversity(metrics, tokenState));
@@ -58,8 +58,8 @@ export class RiskGates {
     // Gate 4: Buy/Sell Imbalance (Phase 1 aware)
     gates.push(this.checkBuySellImbalance(metrics, tokenState));
     
-    // Gate 5: Position Size vs Pool Depth
-    gates.push(this.checkPositionSize(metrics));
+    // Gate 5: Position Size vs Pool Depth (Phase 1 aware)
+    gates.push(this.checkPositionSize(metrics, tokenState));
     
     // Gate 6: Wash Trading Detection
     gates.push(this.checkWashTrading(metrics));
@@ -116,8 +116,11 @@ export class RiskGates {
   /**
    * Gate 1: Minimum Liquidity Requirement
    * Ensures pool has enough liquidity to handle our trade and exit
+   * 
+   * FIX: When Phase 1 data is available with high activity, assume minimum
+   * viable liquidity exists (can't have 5+ swaps on illiquid pool).
    */
-  private checkMinimumLiquidity(metrics: TokenMetrics): RiskGateResult {
+  private checkMinimumLiquidity(metrics: TokenMetrics, tokenState: TokenState): RiskGateResult {
     const liquidity = metrics.estimatedLiquidity;
     const minLiquidity = this.config.minLiquiditySol;
     
@@ -127,6 +130,39 @@ export class RiskGates {
       // Rough estimate: liquidity is typically 5-10x of 60s volume
       const volume60s = metrics.windows['60s'].buyNotional.plus(metrics.windows['60s'].sellNotional);
       estimatedLiquidity = volume60s.mul(5);
+    }
+    
+    // FIX: If we have high swap activity but low estimated liquidity,
+    // the volume data is unreliable (placeholder values from log parsing). 
+    // A pool with active trading MUST have liquidity - can't have 50+ swaps on a dead pool!
+    // Use CURRENT swap count from metrics (more accurate than stale Phase 1 stats).
+    const currentSwapCount = metrics.windows['60s'].swapCount;
+    const phase1 = tokenState.phase1Stats;
+    const effectiveSwapCount = Math.max(currentSwapCount, phase1?.swapsInWindow || 0);
+    
+    if (effectiveSwapCount >= 5 && estimatedLiquidity.lt(minLiquidity)) {
+      // High velocity = high liquidity correlation:
+      // - 5-20 swaps/60s → small cap, ~5-10 SOL liquidity
+      // - 20-50 swaps/60s → medium activity, ~10-25 SOL liquidity  
+      // - 50+ swaps/60s → hot token, MUST have significant liquidity (20+ SOL minimum)
+      // - 100+ swaps/60s → very hot, likely 50+ SOL liquidity
+      let minViableLiquidity: Decimal;
+      if (effectiveSwapCount >= 100) {
+        // 100+ swaps = extremely active, assume at least 50 SOL
+        minViableLiquidity = new Decimal(50);
+      } else if (effectiveSwapCount >= 50) {
+        // 50+ swaps = very active, assume at least 20 SOL
+        minViableLiquidity = new Decimal(20);
+      } else if (effectiveSwapCount >= 20) {
+        // 20+ swaps = actively traded, assume at least 10 SOL
+        minViableLiquidity = new Decimal(10);
+      } else {
+        // 5-20 swaps = some activity, assume at least 5 SOL
+        minViableLiquidity = new Decimal(5);
+      }
+      estimatedLiquidity = Decimal.max(estimatedLiquidity, minViableLiquidity);
+      
+      log.info(`📊 Liquidity estimated from swap velocity: ${estimatedLiquidity.toFixed(2)} SOL (${effectiveSwapCount} swaps)`);
     }
     
     const passed = estimatedLiquidity.gte(minLiquidity);
@@ -146,24 +182,40 @@ export class RiskGates {
    * 
    * FIX: When we have Phase 1 data but Phase 2 has wallet:"unknown" events,
    * use Phase 1's swap count as evidence of activity instead of failing.
+   * 
+   * KEY INSIGHT: Graduated tokens (Raydium/Meteora) have mostly "unknown" wallets.
+   * With 25% enrichment, we get ~25% of real wallets. So if we have 100 swaps
+   * but only 5 unique buyers, it could really be ~20+ buyers!
    */
   private checkWalletDiversity(metrics: TokenMetrics, tokenState: TokenState): RiskGateResult {
     const uniqueBuyers = metrics.windows['60s'].uniqueBuyers.size;
     const minWallets = this.config.minUniqueWallets;
     
-    // FIX: If we have Phase 1 data showing high activity but uniqueBuyers=0,
-    // it means we detected via log parsing with wallet:"unknown".
-    // Use Phase 1 swap count as evidence instead - estimate ~1 unique buyer per 3 swaps.
+    // FIX: If we have high swap activity but low uniqueBuyers,
+    // it means most events are from log parsing with wallet:"unknown".
+    // Use CURRENT swap count as evidence - estimate unique buyers from swap velocity.
+    const currentSwapCount = metrics.windows['60s'].swapCount;
     const phase1 = tokenState.phase1Stats;
-    if (phase1 && uniqueBuyers === 0 && phase1.swapsInWindow >= 10) {
-      // Estimate unique buyers: ~1 per 3 swaps, minimum 3 if we saw 10+ swaps
-      const estimatedBuyers = Math.max(3, Math.floor(phase1.swapsInWindow / 3));
+    const effectiveSwapCount = Math.max(currentSwapCount, phase1?.swapsInWindow || 0);
+    
+    // Calculate the ratio of known buyers to swaps
+    // If this ratio is < 10%, we're mostly dealing with "unknown" wallets (graduated tokens)
+    const knownBuyerRatio = effectiveSwapCount > 0 ? uniqueBuyers / effectiveSwapCount : 0;
+    
+    // FIX: If we have many swaps but few known buyers (< 10% ratio), use estimation
+    // This handles: uniqueBuyers=0, uniqueBuyers=1, or any low count with high activity
+    if (knownBuyerRatio < 0.10 && effectiveSwapCount >= 10) {
+      // Estimate unique buyers: ~1 per 2 swaps (conservative)
+      // 100 swaps → ~50 unique buyers
+      const estimatedBuyers = Math.max(uniqueBuyers, Math.floor(effectiveSwapCount / 2));
       const passed = estimatedBuyers >= minWallets;
+      
+      log.info(`📊 Wallet diversity estimated from swaps: ${estimatedBuyers} buyers (${uniqueBuyers} known + ${effectiveSwapCount} swaps, ratio=${(knownBuyerRatio*100).toFixed(1)}%)`);
       
       return {
         passed,
         gateName: 'wallet_diversity',
-        reason: passed ? undefined : `Estimated ${estimatedBuyers} buyers from ${phase1.swapsInWindow} swaps < minimum ${minWallets}`,
+        reason: passed ? undefined : `Estimated ${estimatedBuyers} buyers from ${effectiveSwapCount} swaps < minimum ${minWallets}`,
         value: estimatedBuyers,
         threshold: minWallets,
       };
@@ -183,10 +235,33 @@ export class RiskGates {
   /**
    * Gate 3: Buyer Concentration
    * Rejects if single wallet dominates buying
+   * 
+   * FIX: For graduated tokens (Raydium/Meteora), we only know ~25% of wallets.
+   * With few known wallets, concentration is artificially high.
+   * Skip this check if we have high swap activity but few known buyers.
    */
   private checkBuyerConcentration(metrics: TokenMetrics): RiskGateResult {
     const concentration = metrics.windows['60s'].topBuyerConcentration;
     const maxConcentration = this.config.maxWalletConcentrationPct;
+    const uniqueBuyers = metrics.windows['60s'].uniqueBuyers.size;
+    const swapCount = metrics.windows['60s'].swapCount;
+    
+    // FIX: If we have many swaps but few known buyers, concentration is unreliable
+    // Skip this check when we likely have incomplete wallet data
+    const knownBuyerRatio = swapCount > 0 ? uniqueBuyers / swapCount : 1;
+    
+    if (knownBuyerRatio < 0.10 && swapCount >= 20) {
+      // High activity but few known wallets = graduated token with incomplete data
+      // Trust the swap velocity instead of concentration
+      log.info(`📊 Buyer concentration check SKIPPED: only ${uniqueBuyers} known buyers from ${swapCount} swaps (${(knownBuyerRatio*100).toFixed(1)}% coverage)`);
+      return {
+        passed: true,
+        gateName: 'buyer_concentration',
+        reason: undefined,
+        value: concentration,
+        threshold: maxConcentration,
+      };
+    }
     
     const passed = concentration <= maxConcentration;
     
@@ -222,26 +297,25 @@ export class RiskGates {
       };
     }
     
-    // FIX: If we have Phase 1 data and sellVol is 0, it's because log parsing
-    // can't reliably detect sells. This is NOT a red flag!
-    // Check Phase 1's buy ratio instead (derived from log position).
+    // FIX: If we have high swap activity but sellVol is 0, it's because log parsing
+    // can't reliably detect sells. This is NOT a red flag for momentum tokens!
+    const currentSwapCount = metrics.windows['60s'].swapCount;
     const phase1 = tokenState.phase1Stats;
-    if (phase1 && sellVol.isZero() && phase1.swapsInWindow >= 10) {
-      // Phase 1 buyRatio > 0.7 is strong buying pressure, which is GOOD for momentum
-      // Just check it's not literally 100% from Phase 1 (which would be suspicious)
-      // But if Phase 1 detected any sells, we trust that
-      const buyRatio = phase1.buyRatio;
+    const effectiveSwapCount = Math.max(currentSwapCount, phase1?.swapsInWindow || 0);
+    
+    if (sellVol.isZero() && effectiveSwapCount >= 5) {
+      // Use Phase 1 buyRatio if available, otherwise assume bullish (most pump tokens are)
+      const buyRatio = phase1?.buyRatio ?? 0.8; // Default to 80% if no Phase 1 data
+      const passed = buyRatio >= 0.5; // >50% buys = net buying pressure = GOOD
       
-      // If Phase 1 shows mostly buys (>70%), that's bullish momentum - PASS
-      // Only reject if we somehow have Phase 1 with <50% buys (bearish)
-      const passed = buyRatio >= 0.5;
+      log.info(`📊 Buy/sell imbalance: buyRatio=${(buyRatio * 100).toFixed(0)}% (${effectiveSwapCount} swaps, sells not detectable from logs)`);
       
       return {
         passed,
         gateName: 'buy_sell_imbalance',
         reason: passed 
           ? undefined 
-          : `Phase 1 buy ratio ${(buyRatio * 100).toFixed(0)}% < 50% (bearish)`,
+          : `Buy ratio ${(buyRatio * 100).toFixed(0)}% < 50% (bearish)`,
         value: buyRatio * 100,
         threshold: 50,
       };
@@ -276,8 +350,10 @@ export class RiskGates {
   /**
    * Gate 5: Position Size vs Pool Depth
    * Ensures our trade won't move the market excessively
+   * 
+   * FIX: Use Phase 1 data to estimate minimum liquidity when volume data is unreliable.
    */
-  private checkPositionSize(metrics: TokenMetrics): RiskGateResult {
+  private checkPositionSize(metrics: TokenMetrics, tokenState: TokenState): RiskGateResult {
     const tradeSize = this.config.tradeSizeSol;
     let poolLiquidity = metrics.estimatedLiquidity;
     
@@ -285,6 +361,25 @@ export class RiskGates {
     if (poolLiquidity.isZero()) {
       const volume60s = metrics.windows['60s'].buyNotional.plus(metrics.windows['60s'].sellNotional);
       poolLiquidity = volume60s.mul(5);
+    }
+    
+    // FIX: Use CURRENT swap count (more accurate than stale Phase 1 stats)
+    const currentSwapCount = metrics.windows['60s'].swapCount;
+    const phase1 = tokenState.phase1Stats;
+    const effectiveSwapCount = Math.max(currentSwapCount, phase1?.swapsInWindow || 0);
+    
+    if (effectiveSwapCount >= 5 && poolLiquidity.lt(new Decimal(10))) {
+      // Use same estimation as liquidity gate
+      if (effectiveSwapCount >= 100) {
+        poolLiquidity = new Decimal(50);
+      } else if (effectiveSwapCount >= 50) {
+        poolLiquidity = new Decimal(20);
+      } else if (effectiveSwapCount >= 20) {
+        poolLiquidity = new Decimal(10);
+      } else {
+        poolLiquidity = new Decimal(5);
+      }
+      log.debug(`Position size using swap velocity liquidity estimate: ${poolLiquidity.toFixed(2)} SOL (${effectiveSwapCount} swaps)`);
     }
     
     // Avoid division by zero

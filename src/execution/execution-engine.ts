@@ -407,6 +407,9 @@ export class ExecutionEngine {
   /**
    * Simulate a trade in paper trading mode.
    * Logs what WOULD have been executed without sending transactions.
+   * 
+   * For bonding curve tokens without Jupiter routes, we simulate based on
+   * estimated price from swap activity.
    */
   private async simulatePaperTrade(
     side: OrderSide,
@@ -418,73 +421,130 @@ export class ExecutionEngine {
     log.info('              🧾 PAPER TRADE (Simulation Only)');
     log.info('═══════════════════════════════════════════════════════════════');
     
-    // Get a real quote to show what would have happened
+    // Try to get a real quote first
+    let quote: any = null;
     try {
-      const quote = side === OrderSide.BUY
+      quote = side === OrderSide.BUY
         ? await this.jupiterClient.getBuyQuote(tokenMint, amount)
         : await this.jupiterClient.getSellQuote(tokenMint, amount);
+    } catch (error) {
+      // Quote failed - will use simulation fallback
+      log.debug('[PAPER] Jupiter quote failed, using simulation');
+    }
+    
+    // If no route (bonding curve token), simulate based on typical pump.fun pricing
+    if (!quote) {
+      log.info('[PAPER] No Jupiter route - simulating bonding curve trade');
       
-      if (!quote) {
-        log.warn('[PAPER] No route available for swap');
-        return {
-          success: false,
-          inputAmount: amount,
-          error: '[PAPER] No route available',
-          retryCount: 0,
-          executionTimeMs: Date.now() - startTime,
-        };
+      // Estimate based on typical bonding curve pricing
+      // Bonding curve: ~30M-50M tokens per SOL at early stage
+      const estimatedTokensPerSol = 40_000_000; // 40M tokens per SOL typical
+      const simulatedSlippage = Math.floor(Math.random() * 100) + 50; // 50-150 bps for bonding curve
+      
+      let estimatedOutput: Decimal;
+      let inputLabel: string;
+      let outputLabel: string;
+      let inputDisplay: string;
+      let outputDisplay: string;
+      let actionLabel: string;
+      
+      if (side === OrderSide.BUY) {
+        // BUY: SOL -> Tokens
+        estimatedOutput = amount.mul(estimatedTokensPerSol).mul(1 - simulatedSlippage / 10000);
+        inputLabel = 'SOL';
+        outputLabel = 'tokens';
+        inputDisplay = `${amount.toFixed(6)} SOL`;
+        outputDisplay = `${estimatedOutput.toFixed(0)} tokens`;
+        actionLabel = 'SIMULATED ENTRY';
+      } else {
+        // SELL: Tokens -> SOL
+        // amount is token count, convert back to SOL
+        const estimatedSolOutput = amount.div(estimatedTokensPerSol).mul(1 - simulatedSlippage / 10000);
+        estimatedOutput = estimatedSolOutput;
+        inputLabel = 'tokens';
+        outputLabel = 'SOL';
+        inputDisplay = `${amount.toFixed(0)} tokens`;
+        outputDisplay = `${estimatedSolOutput.toFixed(6)} SOL`;
+        actionLabel = 'SIMULATED EXIT';
       }
       
-      // Log detailed simulation info
+      const estimatedPricePerToken = new Decimal(1).div(estimatedTokensPerSol); // Price in SOL per token
+      
       log.info(`[PAPER] Side:            ${side}`);
       log.info(`[PAPER] Token:           ${tokenMint}`);
-      log.info(`[PAPER] Input:           ${quote.inputAmount.div(1e9).toFixed(6)} SOL`);
-      log.info(`[PAPER] Expected Output: ${quote.expectedOutputAmount.toString()} tokens`);
-      log.info(`[PAPER] Min Output:      ${quote.minimumOutputAmount.toString()} tokens`);
-      log.info(`[PAPER] Price Impact:    ${quote.priceImpactBps} bps (${(quote.priceImpactBps / 100).toFixed(2)}%)`);
-      log.info(`[PAPER] Slippage:        ${this.config.maxSlippageBps} bps`);
-      log.info(`[PAPER] Route:           ${this.summarizeRoute(quote.route)}`);
+      log.info(`[PAPER] Input:           ${inputDisplay}`);
+      log.info(`[PAPER] Est. Output:     ${outputDisplay}`);
+      log.info(`[PAPER] Est. Price:      ${estimatedPricePerToken.toExponential(4)} SOL/token`);
+      log.info(`[PAPER] Est. Slippage:   ${simulatedSlippage} bps (bonding curve estimate)`);
+      log.info(`[PAPER] Route:           pump.fun Bonding Curve (simulated)`);
       log.info('───────────────────────────────────────────────────────────────');
-      log.info('[PAPER] Transaction would be submitted to network');
-      log.info('[PAPER] ⚠️  NO REAL TRANSACTION SENT - Paper trading mode');
+      log.info(`[PAPER] ✅ ${actionLabel} - Bonding curve token`);
+      log.info('[PAPER] ⚠️  NO REAL TRANSACTION - Paper trading mode');
       log.info('═══════════════════════════════════════════════════════════════');
-      
-      // Simulate successful execution
-      const simulatedSlippage = Math.floor(Math.random() * 50); // Random 0-50 bps
-      const simulatedOutput = quote.expectedOutputAmount.mul(1 - simulatedSlippage / 10000);
       
       logEvent(LogEventType.ORDER_CONFIRMED, {
         paperTrading: true,
+        simulated: true,
         side,
         tokenMint,
-        inputAmount: quote.inputAmount.toString(),
-        outputAmount: simulatedOutput.toString(),
+        inputAmount: side === OrderSide.BUY ? amount.mul(1e9).toString() : amount.toString(), // lamports for SOL, raw for tokens
+        outputAmount: estimatedOutput.toString(),
         slippageBps: simulatedSlippage,
-        priceImpactBps: quote.priceImpactBps,
+        priceImpactBps: simulatedSlippage, // Use slippage as proxy
       });
       
       return {
         success: true,
-        signature: `PAPER_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+        signature: `PAPER_SIM_${Date.now()}_${Math.random().toString(36).slice(2)}`,
         confirmedSlot: 0,
-        inputAmount: side === OrderSide.BUY ? amount : quote.inputAmount,
-        actualOutputAmount: simulatedOutput,
-        expectedOutputAmount: quote.expectedOutputAmount,
+        inputAmount: amount,
+        actualOutputAmount: estimatedOutput,
+        expectedOutputAmount: estimatedOutput,
         slippageBps: simulatedSlippage,
         retryCount: 0,
         executionTimeMs: Date.now() - startTime,
       };
-      
-    } catch (error) {
-      log.error('[PAPER] Simulation failed', error as Error);
-      return {
-        success: false,
-        inputAmount: amount,
-        error: `[PAPER] ${(error as Error).message}`,
-        retryCount: 0,
-        executionTimeMs: Date.now() - startTime,
-      };
     }
+    
+    // Have a real quote - log detailed info
+    log.info(`[PAPER] Side:            ${side}`);
+    log.info(`[PAPER] Token:           ${tokenMint}`);
+    log.info(`[PAPER] Input:           ${quote.inputAmount.div(1e9).toFixed(6)} SOL`);
+    log.info(`[PAPER] Expected Output: ${quote.expectedOutputAmount.toString()} tokens`);
+    log.info(`[PAPER] Min Output:      ${quote.minimumOutputAmount.toString()} tokens`);
+    log.info(`[PAPER] Price Impact:    ${quote.priceImpactBps} bps (${(quote.priceImpactBps / 100).toFixed(2)}%)`);
+    log.info(`[PAPER] Slippage:        ${this.config.maxSlippageBps} bps`);
+    log.info(`[PAPER] Route:           ${this.summarizeRoute(quote.route)}`);
+    log.info('───────────────────────────────────────────────────────────────');
+    log.info('[PAPER] Transaction would be submitted to network');
+    log.info('[PAPER] ⚠️  NO REAL TRANSACTION SENT - Paper trading mode');
+    log.info('═══════════════════════════════════════════════════════════════');
+    
+    // Simulate successful execution
+    const simulatedSlippage = Math.floor(Math.random() * 50); // Random 0-50 bps
+    const simulatedOutput = quote.expectedOutputAmount.mul(1 - simulatedSlippage / 10000);
+    
+    logEvent(LogEventType.ORDER_CONFIRMED, {
+      paperTrading: true,
+      side,
+      tokenMint,
+      inputAmount: quote.inputAmount.toString(),
+      outputAmount: simulatedOutput.toString(),
+      slippageBps: simulatedSlippage,
+      priceImpactBps: quote.priceImpactBps,
+    });
+    
+    return {
+      success: true,
+      signature: `PAPER_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+      confirmedSlot: 0,
+      inputAmount: side === OrderSide.BUY ? amount : quote.inputAmount,
+      actualOutputAmount: simulatedOutput,
+      expectedOutputAmount: quote.expectedOutputAmount,
+      slippageBps: simulatedSlippage,
+      retryCount: 0,
+      executionTimeMs: Date.now() - startTime,
+    };
   }
   
   /**

@@ -9,11 +9,15 @@
  * - Price increases as more tokens are bought
  * - Once market cap reaches ~$69k, token "graduates" to Raydium
  * - Early detection here can catch tokens before they moon
+ * 
+ * KEY: Uses IDL-based decoding of "Program data:" for EXACT swap data!
+ * No more guessing - we decode the TradeEvent directly from the logs.
  */
 
 import Decimal from 'decimal.js';
 import { SwapEvent, SwapDirection, DEXSource } from '../../types';
 import { isValidTokenMint, isKnownProgram } from './known-addresses';
+import { parsePumpFunSwapsFromLogs } from '../pump-idl-parser';
 
 // Pump.fun bonding curve log patterns
 const BUY_PATTERN = /Program log: Instruction: Buy/i;
@@ -90,30 +94,55 @@ function isLikelyTokenMint(address: string): boolean {
 /**
  * Parse Pump.fun bonding curve logs into SwapEvent objects.
  * 
- * Pump.fun emits logs with:
- * - Token mint address
- * - SOL amount
- * - Token amount
- * - Bonding curve state
+ * TWO APPROACHES (in order of preference):
+ * 1. IDL-based decoding: Decode "Program data:" directly for EXACT values
+ * 2. Heuristic fallback: Pattern matching on log strings
+ * 
+ * The IDL approach gives us EXACT data: mint, sol_amount, is_buy, user, timestamp
+ * from the TradeEvent struct emitted by the pump.fun program.
  */
 export function parsePumpFunSwap(
   signature: string,
   slot: number,
   logs: string[]
 ): SwapEvent[] {
-  const events: SwapEvent[] = [];
+  // APPROACH 1: Try IDL-based decoding first (EXACT DATA!)
+  // This decodes the TradeEvent directly from "Program data:" logs
+  const idlEvents = parsePumpFunSwapsFromLogs(logs, signature, slot);
   
+  if (idlEvents.length > 0) {
+    // Validate and return IDL-decoded events
+    const validEvents: SwapEvent[] = [];
+    for (const event of idlEvents) {
+      // Sanity check
+      if (event.tokenMint && 
+          event.tokenMint.endsWith('pump') &&
+          event.walletAddress &&
+          event.walletAddress !== 'unknown' &&
+          !isPumpfunInfrastructure(event.walletAddress) &&
+          event.notionalSol.gt(0) &&
+          event.notionalSol.lt(1000)) {
+        validEvents.push(event);
+      }
+    }
+    
+    if (validEvents.length > 0) {
+      return validEvents;
+    }
+  }
+  
+  // APPROACH 2: Fall back to heuristic parsing
   // Check if this is a buy/sell transaction
   const hasSwapInstruction = logs.some(log => SWAP_PATTERN.test(log));
   if (!hasSwapInstruction) {
-    return events;
+    return [];
   }
   
   // Determine direction from instruction type
   const isBuy = logs.some(log => BUY_PATTERN.test(log));
   const isSell = logs.some(log => SELL_PATTERN.test(log));
   
-  // Parse the swap data from logs
+  // Parse the swap data from logs using heuristics
   const parsed = parsePumpFunLogs(logs, isBuy, isSell);
   
   // STRICT: Only emit event if we have VALID data
@@ -125,7 +154,7 @@ export function parsePumpFunSwap(
       !isPumpfunInfrastructure(parsed.walletAddress) &&  // Wallet can't be infrastructure
       parsed.notionalSol.gt(0) &&
       parsed.notionalSol.lt(1000)) {  // Sanity check: < 1000 SOL per trade
-    events.push({
+    return [{
       signature,
       slot,
       timestamp: Date.now(),
@@ -135,10 +164,10 @@ export function parsePumpFunSwap(
       walletAddress: parsed.walletAddress,
       dexSource: DEXSource.PUMPFUN,
       poolAddress: parsed.bondingCurve || undefined,
-    });
+    }];
   }
   
-  return events;
+  return [];
 }
 
 /**

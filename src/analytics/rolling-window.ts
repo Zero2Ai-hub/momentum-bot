@@ -4,7 +4,7 @@
  */
 
 import Decimal from 'decimal.js';
-import { SwapEvent, SwapDirection, WindowMetrics } from '../types';
+import { SwapEvent, SwapDirection, WindowMetrics, DEXSource } from '../types';
 
 interface TimestampedEvent {
   timestamp: number;
@@ -34,6 +34,14 @@ export class RollingWindow {
     this.windowSizeMs = windowSizeMs;
   }
   
+  // Minimum notional to count as a real trade (filter dust/dead tokens)
+  // Only applied to pump.fun bonding curve events (where we have real data)
+  // Raydium/Meteora events have placeholder notional and shouldn't be filtered
+  private static readonly MIN_NOTIONAL_SOL = 0.05;
+  
+  // Placeholder values used when we can't parse real data
+  private static readonly PLACEHOLDER_NOTIONAL = 0.01;
+  
   /**
    * Add a new event to the window.
    * Returns true if window state changed (for triggering score updates).
@@ -43,6 +51,19 @@ export class RollingWindow {
     
     // First, expire old events
     this.expireOldEvents(now);
+    
+    // DUST FILTER: Skip trades with negligible notional value
+    // BUT: Only apply to pump.fun events (where we have REAL data from IDL)
+    // Raydium/Meteora events have placeholder notional - don't filter those!
+    const notionalNum = event.notionalSol.toNumber();
+    const isPumpfunSource = event.dexSource === DEXSource.PUMPFUN || event.dexSource === DEXSource.PUMPSWAP;
+    const isPlaceholderNotional = Math.abs(notionalNum - RollingWindow.PLACEHOLDER_NOTIONAL) < 0.001;
+    
+    // Only filter dust for pump.fun where we KNOW the real notional
+    // For Raydium/Meteora, trust swap count as momentum signal
+    if (isPumpfunSource && !isPlaceholderNotional && notionalNum < RollingWindow.MIN_NOTIONAL_SOL) {
+      return false;
+    }
     
     // Add new event
     this.events.push({ timestamp: event.timestamp, event });

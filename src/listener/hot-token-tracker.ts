@@ -297,6 +297,34 @@ export class HotTokenTracker {
       return;
     }
     
+    // QUALITY FILTERS - different criteria based on data quality
+    const hasRealWalletData = windowStats.uniqueWallets.size > 0;
+    
+    if (hasRealWalletData) {
+      // For pump.fun bonding curve: We have real wallet data from IDL
+      // Apply strict quality filters
+      
+      // Require minimum unique wallets (prevents bot churn)
+      const MIN_UNIQUE_WALLETS = 4;
+      if (windowStats.uniqueWallets.size < MIN_UNIQUE_WALLETS) {
+        return;
+      }
+      
+      // Require positive buy momentum (more buys than sells)
+      const buyRatioCheck = windowStats.buys / Math.max(windowStats.count, 1);
+      const MIN_BUY_RATIO = 0.5; // At least 50% buys
+      if (buyRatioCheck < MIN_BUY_RATIO) {
+        return;
+      }
+    } else {
+      // For Raydium/Meteora: No real wallet data, use higher swap threshold
+      // This catches graduated tokens like Buttcoin/RAAAAAH
+      const MIN_SWAPS_NO_WALLET_DATA = 10; // Higher threshold to compensate
+      if (windowStats.count < MIN_SWAPS_NO_WALLET_DATA) {
+        return;
+      }
+    }
+    
     // ═══════════════════════════════════════════════════════════════
     // QUIET → HOT TRANSITION CHECK
     // ═══════════════════════════════════════════════════════════════
@@ -428,6 +456,20 @@ export class HotTokenTracker {
       .filter(s => s.timestamp >= windowStart)
       .slice(-limit)
       .map(s => s.signature);
+  }
+  
+  /**
+   * Get current swap count in window for a token
+   * Used by EventListener to determine enrichment rate
+   */
+  getTokenSwapCount(candidate: string): number {
+    const activity = this.tokenActivity.get(candidate);
+    if (!activity) return 0;
+    
+    const now = Date.now();
+    const windowStart = now - this.hotTokenWindowMs;
+    
+    return activity.swaps.filter(s => s.timestamp >= windowStart).length;
   }
   
   /**

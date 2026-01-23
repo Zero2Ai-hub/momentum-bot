@@ -24,7 +24,7 @@ export const KNOWN_PROGRAM_IDS = new Set([
   'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo',         // Meteora
   '9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP',        // Orca Token Swap V2
   'DjVE6JNiYqPL2QXyCUUh8rNjHrbz9hXHNYt99MQ59qw1',        // Orca Token Swap V1
-  'pswapRwCM9XkqRitvwZwYnBMu8aHq5W4zT2oM4VaSyg',         // PumpSwap (pump.fun DEX)
+  'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',         // PumpSwap (pump.fun DEX)
   '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',         // Pump.fun Bonding Curve
   
   // Pump.fun Infrastructure (fee accounts that appear as tokens/wallets)

@@ -16,9 +16,9 @@ const parsedSignatures = new Set<string>();
 const MAX_CACHE_SIZE = 5000;
 
 // Rate limiting for getParsedTransaction calls
-// Helius Free tier: 10 RPC/sec total - we use ~5/sec for parsing
+// Helius Free tier: 10 RPC/sec total - increase to 8/sec for parsing
 let lastParseCall = 0;
-const MIN_PARSE_INTERVAL_MS = 200; // ~5 calls/second max
+const MIN_PARSE_INTERVAL_MS = 125; // ~8 calls/second max (was 200ms = 5/sec)
 let parseQueue: Promise<any> = Promise.resolve();
 
 // wSOL mint - treat as base currency, not a token
@@ -37,6 +37,72 @@ const MAX_NOTIONAL_SOL = 10000;  // 10000 SOL maximum (sanity check)
 
 // Debug mode
 const DEBUG = process.env.DEBUG === '1';
+
+// Separate rate limiter for lightweight signer extraction (cheaper calls)
+let lastSignerCall = 0;
+const MIN_SIGNER_INTERVAL_MS = 50; // ~20 calls/second (cheaper than full parse)
+let signerQueue: Promise<any> = Promise.resolve();
+
+/**
+ * LIGHTWEIGHT: Extract just the signer (fee payer) from a transaction
+ * 
+ * This is MUCH cheaper than getParsedTransaction because:
+ * - Uses getTransaction (not getParsed)
+ * - Only extracts accountKeys[0] (fee payer = signer)
+ * - No token balance parsing
+ * 
+ * Per the audit: "decode PumpSwap events + lightweight signer extraction = real data without estimates"
+ */
+export async function extractSignerFromTransaction(
+  connection: Connection,
+  signature: string
+): Promise<string | null> {
+  // Rate-limited RPC call through separate queue
+  const signer = await new Promise<string | null>((resolve) => {
+    signerQueue = signerQueue.then(async () => {
+      const now = Date.now();
+      const timeSinceLastCall = now - lastSignerCall;
+      if (timeSinceLastCall < MIN_SIGNER_INTERVAL_MS) {
+        await new Promise(r => setTimeout(r, MIN_SIGNER_INTERVAL_MS - timeSinceLastCall));
+      }
+      lastSignerCall = Date.now();
+      
+      try {
+        // Use getTransaction (not getParsedTransaction) - much lighter
+        const tx = await connection.getTransaction(signature, {
+          maxSupportedTransactionVersion: 0,
+        });
+        
+        if (!tx || !tx.transaction || !tx.transaction.message) {
+          resolve(null);
+          return;
+        }
+        
+        // Get account keys - fee payer is always first
+        const message = tx.transaction.message;
+        let signerPubkey: string | null = null;
+        
+        // Handle both legacy and versioned message formats
+        if ('accountKeys' in message && Array.isArray(message.accountKeys)) {
+          // Legacy format
+          signerPubkey = message.accountKeys[0]?.toString() || null;
+        } else if ('staticAccountKeys' in message && Array.isArray(message.staticAccountKeys)) {
+          // Versioned format
+          signerPubkey = message.staticAccountKeys[0]?.toString() || null;
+        }
+        
+        resolve(signerPubkey);
+      } catch (error) {
+        if (DEBUG) {
+          log.debug(`Signer extraction failed: ${signature.slice(0, 16)}...`);
+        }
+        resolve(null);
+      }
+    });
+  });
+  
+  return signer;
+}
 
 interface TokenDelta {
   mint: string;
@@ -126,64 +192,98 @@ export async function parseTransactionWithHelius(
     }
     
     if (!signerPubkey || signerIndex < 0) {
+      log.debug(`PARSE_SKIP: No signer found | sig=${signature.slice(0, 16)}`);
       return null; // No signer found
     }
     
-    // STEP 2: Build per-mint deltas for signer-owned token accounts
+    // STEP 2: Build per-mint deltas
+    // First try signer-owned accounts, then fall back to ALL accounts
     const mintDeltas = new Map<string, TokenDelta>();
     
-    // Build lookup for pre-balances
+    // Build lookup for ALL pre-balances (we'll filter later)
     const preBalanceMap = new Map<number, { mint: string; amount: number; decimals: number; owner: string }>();
     for (const bal of preBalances) {
-      if (bal.owner === signerPubkey) {
-        preBalanceMap.set(bal.accountIndex, {
-          mint: bal.mint,
-          amount: parseFloat(bal.uiTokenAmount.uiAmountString || '0'),
-          decimals: bal.uiTokenAmount.decimals,
-          owner: bal.owner,
-        });
-      }
+      preBalanceMap.set(bal.accountIndex, {
+        mint: bal.mint,
+        amount: parseFloat(bal.uiTokenAmount.uiAmountString || '0'),
+        decimals: bal.uiTokenAmount.decimals,
+        owner: bal.owner,
+      });
     }
     
-    // Build lookup for post-balances
+    // Build lookup for ALL post-balances
     const postBalanceMap = new Map<number, { mint: string; amount: number; decimals: number; owner: string }>();
     for (const bal of postBalances) {
-      if (bal.owner === signerPubkey) {
-        postBalanceMap.set(bal.accountIndex, {
-          mint: bal.mint,
-          amount: parseFloat(bal.uiTokenAmount.uiAmountString || '0'),
-          decimals: bal.uiTokenAmount.decimals,
-          owner: bal.owner,
-        });
-      }
+      postBalanceMap.set(bal.accountIndex, {
+        mint: bal.mint,
+        amount: parseFloat(bal.uiTokenAmount.uiAmountString || '0'),
+        decimals: bal.uiTokenAmount.decimals,
+        owner: bal.owner,
+      });
     }
     
-    // Collect all account indices with signer-owned balances
-    const accountIndices = new Set([...preBalanceMap.keys(), ...postBalanceMap.keys()]);
+    // FIRST: Try signer-owned balances only
+    const signerPreBalances = new Map<number, { mint: string; amount: number; decimals: number; owner: string }>();
+    const signerPostBalances = new Map<number, { mint: string; amount: number; decimals: number; owner: string }>();
+    for (const [idx, bal] of preBalanceMap) {
+      if (bal.owner === signerPubkey) signerPreBalances.set(idx, bal);
+    }
+    for (const [idx, bal] of postBalanceMap) {
+      if (bal.owner === signerPubkey) signerPostBalances.set(idx, bal);
+    }
     
-    for (const idx of accountIndices) {
-      const pre = preBalanceMap.get(idx);
-      const post = postBalanceMap.get(idx);
+    // Try signer-owned balances first
+    const signerAccountIndices = new Set([...signerPreBalances.keys(), ...signerPostBalances.keys()]);
+    
+    for (const idx of signerAccountIndices) {
+      const pre = signerPreBalances.get(idx);
+      const post = signerPostBalances.get(idx);
       
-      // Determine mint (could be in pre, post, or both)
       const mint = pre?.mint || post?.mint;
       if (!mint) continue;
-      
-      // Skip base currencies
       if (BASE_MINTS.has(mint)) continue;
       
       const preAmount = pre?.amount || 0;
       const postAmount = post?.amount || 0;
       const decimals = pre?.decimals || post?.decimals || 0;
-      
       const delta = postAmount - preAmount;
       
-      // Aggregate deltas by mint (in case signer has multiple accounts for same mint)
       if (mintDeltas.has(mint)) {
         const existing = mintDeltas.get(mint)!;
         existing.delta += delta;
       } else {
         mintDeltas.set(mint, { mint, delta, decimals });
+      }
+    }
+    
+    // FALLBACK: If no signer deltas found, look at ALL token balance changes
+    // This handles cases where tokens flow through pool accounts
+    const hasSignerDelta = Array.from(mintDeltas.values()).some(d => Math.abs(d.delta) > 0);
+    if (!hasSignerDelta) {
+      const allAccountIndices = new Set([...preBalanceMap.keys(), ...postBalanceMap.keys()]);
+      
+      for (const idx of allAccountIndices) {
+        const pre = preBalanceMap.get(idx);
+        const post = postBalanceMap.get(idx);
+        
+        const mint = pre?.mint || post?.mint;
+        if (!mint) continue;
+        if (BASE_MINTS.has(mint)) continue;
+        
+        const preAmount = pre?.amount || 0;
+        const postAmount = post?.amount || 0;
+        const decimals = pre?.decimals || post?.decimals || 0;
+        const delta = postAmount - preAmount;
+        
+        // Only consider non-zero deltas for fallback
+        if (Math.abs(delta) > 0.000001) {
+          if (mintDeltas.has(mint)) {
+            const existing = mintDeltas.get(mint)!;
+            existing.delta += delta;
+          } else {
+            mintDeltas.set(mint, { mint, delta, decimals });
+          }
+        }
       }
     }
     
@@ -198,44 +298,64 @@ export async function parseTransactionWithHelius(
       }
     }
     
-    if (!selectedMint || selectedDelta === 0) {
-      if (DEBUG) {
-        log.debug('No signer-owned token delta found', { signature: signature.slice(0, 16), signer: signerPubkey.slice(0, 8) });
-      }
-      return null; // No swap detected
-    }
-    
-    // STEP 4: Determine direction
-    const direction = selectedDelta > 0 ? SwapDirection.BUY : SwapDirection.SELL;
-    
-    // STEP 5: Compute SOL notional from signer's balance change
+    // STEP 4-5: Compute direction and SOL notional
+    let direction: SwapDirection;
     let notionalSol = new Decimal(0);
     
-    if (preSOL && postSOL && signerIndex < preSOL.length) {
-      const preSolLamports = preSOL[signerIndex];
-      const postSolLamports = postSOL[signerIndex];
-      const rawChange = postSolLamports - preSolLamports;
+    // Get SOL change first - we need this for both token-delta and SOL-only methods
+    const preSolLamports = (preSOL && signerIndex < preSOL.length) ? preSOL[signerIndex] : 0;
+    const postSolLamports = (postSOL && signerIndex < postSOL.length) ? postSOL[signerIndex] : 0;
+    const solChangeLamports = postSolLamports - preSolLamports; // positive = received SOL
+    
+    // If no token delta but we have token accounts in the tx, use SOL delta as proxy
+    if (!selectedMint || selectedDelta === 0) {
+      // Find any pump.fun token in the balance list (even if delta is 0)
+      const pumpMints = Array.from(new Set([...preBalances, ...postBalances]
+        .map(b => b.mint)
+        .filter(m => m && m.endsWith('pump') && !BASE_MINTS.has(m))
+      ));
+      
+      if (pumpMints.length === 0) {
+        // No pump tokens at all - skip
+        log.debug(`PARSE_SKIP: No pump token in balance list | sig=${signature.slice(0, 16)} | mints=${preBalances.map((b: any) => b.mint.slice(0, 8)).join(',')}`);
+        return null;
+      }
+      
+      // Use the first pump mint found
+      selectedMint = pumpMints[0];
+      
+      // Use SOL change to determine direction
+      const solChangeWithoutFee = solChangeLamports + fee; // add back fee for net assessment
+      if (Math.abs(solChangeWithoutFee) < 10000) { // < 0.00001 SOL - probably just fee
+        log.debug(`PARSE_SKIP: SOL delta too small (${solChangeWithoutFee/1e9}) | sig=${signature.slice(0, 16)} | mint=${selectedMint!.slice(0, 12)}`);
+        return null;
+      }
+      
+      // If SOL decreased (negative), signer bought tokens
+      // If SOL increased (positive), signer sold tokens
+      direction = solChangeWithoutFee < 0 ? SwapDirection.BUY : SwapDirection.SELL;
+      notionalSol = new Decimal(Math.abs(solChangeWithoutFee)).div(1e9);
+      
+      if (DEBUG) {
+        log.debug('Using SOL delta fallback', {
+          signature: signature.slice(0, 16),
+          mint: selectedMint!.slice(0, 16),
+          solChange: notionalSol.toString(),
+          direction
+        });
+      }
+    } else {
+      // Normal case: we have a token delta
+      direction = selectedDelta > 0 ? SwapDirection.BUY : SwapDirection.SELL;
       
       if (direction === SwapDirection.BUY) {
-        // BUY: signer spent SOL (pre > post after accounting for fees)
-        // solSpent = (pre - post) - fee (fee is already deducted from post)
         const solSpentLamports = preSolLamports - postSolLamports - fee;
-        
-        // Sanity: if delta > 0 (bought tokens) but solSpent <= 0, invalid parse
         if (solSpentLamports <= 0) {
-          if (DEBUG) {
-            log.debug('Invalid BUY: non-positive SOL spent', { 
-              signature: signature.slice(0, 16), 
-              solSpent: solSpentLamports / 1e9,
-              tokenDelta: selectedDelta 
-            });
-          }
+          log.debug(`PARSE_SKIP: BUY with non-positive SOL spent (${(solSpentLamports/1e9).toFixed(4)}) | sig=${signature.slice(0, 16)} | tokenDelta=${selectedDelta}`);
           return null;
         }
         notionalSol = new Decimal(solSpentLamports).div(1e9);
       } else {
-        // SELL: signer received SOL (post > pre)
-        // solReceived = post - pre (fee already included in balance changes)
         const solReceivedLamports = postSolLamports - preSolLamports;
         
         // For sells, negative raw change after fee means no SOL received - might be a different base
@@ -282,8 +402,13 @@ export async function parseTransactionWithHelius(
       dexSource = DEXSource.METEORA;
     } else if (programIds.some((p: string) => p.includes('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'))) {
       dexSource = DEXSource.PUMPFUN;
-    } else if (programIds.some((p: string) => p.includes('pswapRwCM9XkqRitvwZwYnBMu8aHq5W4zT2oM4VaSyg'))) {
+    } else if (programIds.some((p: string) => p.includes('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA'))) {
       dexSource = DEXSource.PUMPSWAP;
+    }
+    
+    // Final guard - selectedMint must be set by now
+    if (!selectedMint) {
+      return null;
     }
     
     // DEBUG output

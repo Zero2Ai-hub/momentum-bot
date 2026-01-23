@@ -315,7 +315,8 @@ export class PositionManager extends EventEmitter<PositionManagerEvents> {
       this.consecutiveBelowExitThreshold.set(position.id, 0);
     }
     
-    // Condition C: Flow reversal
+    // Condition C: Flow reversal (sell pressure overwhelming buys)
+    // Quick detection is CRITICAL - dumps happen fast!
     const metrics = tokenState.getMetrics();
     const netInflow = metrics.windows['15s'].netInflow;
     
@@ -325,7 +326,9 @@ export class PositionManager extends EventEmitter<PositionManagerEvents> {
       position.consecutiveNegativeInflow = consecutive;
       
       // Exit after 5 consecutive checks with negative inflow
+      // This is intentionally sensitive - dumps happen FAST
       if (consecutive >= 5) {
+        log.info(`🔴 FLOW_REVERSAL triggered: 15s netInflow=${netInflow.toFixed(2)} SOL (${consecutive} consecutive)`);
         return { shouldExit: true, reason: ExitReason.FLOW_REVERSAL };
       }
     } else {

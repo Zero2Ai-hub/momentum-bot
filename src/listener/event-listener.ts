@@ -21,12 +21,14 @@ import { getConfig } from '../config/config';
 import { logEvent, log } from '../logging/logger';
 import { validateSwapEvent, isValidTokenMint } from './parsers/known-addresses';
 import { isValidTradeableToken, initializeTokenVerifier, isVerifiedToken } from './token-verifier';
-import { parseTransactionWithHelius } from './helius-parser';
+import { parseTransactionWithHelius, extractSignerFromTransaction } from './helius-parser';
 import { getHotTokenTracker, HotTokenTracker, HotDetectionStats } from './hot-token-tracker';
 import { parseRaydiumSwap } from './parsers/raydium';
 import { parsePumpFunSwap } from './parsers/pumpfun';
 import { parsePumpSwapLogs } from './parsers/pumpswap';
 import { getTokenUniverse } from '../universe/token-universe';
+import { resolveVenueForMint, isPumpOriginMint, VenueResolution, recordTokenVenue, getVenueCacheStats } from './venue-resolver';
+import { parsePumpSwapSwapsFromLogs } from './pumpswap-idl-parser';
 
 // ═══════════════════════════════════════════════════════════════════
 // Types
@@ -59,8 +61,12 @@ interface Phase1Candidate {
 interface RpcCounters {
   getParsedTransaction: number;
   getAccountInfo: number;
+  getTransaction: number; // Lightweight signer extraction (for PumpSwap)
   pumpEventsEmittedNoTxParse: number;
 }
+
+// Debug mode
+const DEBUG = process.env.DEBUG === '1';
 
 // Quality gate thresholds
 const MIN_UNIQUE_WALLETS = 4;
@@ -103,6 +109,7 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
   private rpcCounters: RpcCounters = {
     getParsedTransaction: 0,
     getAccountInfo: 0,
+    getTransaction: 0, // Lightweight signer extraction
     pumpEventsEmittedNoTxParse: 0,
   };
   
@@ -274,6 +281,9 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
         candidate.wallet
       );
       
+      // Record venue observation (for venue resolver)
+      recordTokenVenue(candidate.candidateAddress, candidate.dexSource);
+      
       // For PUMPFUN/PUMPSWAP sources: buffer events (they have real data from logs)
       // For non-pump sources: emit event if token is already verified
       if (candidate.isPumpSource) {
@@ -373,16 +383,21 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     
     this.emit('swap', event);
     
-    // Rate-limited RPC parsing for enriched data (async, fire-and-forget)
-    // Only parse ~20% of swaps to save credits, but still emit all
-    if (Math.random() < 0.20) {
-      this.enrichSwapWithRpc(candidate.candidateAddress, signature);
-    }
+    // 100% ENRICHMENT: Get REAL wallet/notional data for ALL Meteora/Raydium swaps
+    // This is essential for accurate buyer diversity and momentum calculation
+    // Credit cost: ~1 credit per getParsedTransaction call
+    this.enrichSwapWithRpc(candidate.candidateAddress, signature);
   }
   
   /**
-   * Enrich a swap event with RPC data (async, fire-and-forget)
-   * This doesn't emit a new event - just improves metrics for risk gates
+   * Enrich a swap event with RPC data and emit an UPDATED event
+   * This is the key to getting REAL data for Meteora/Raydium graduated tokens!
+   * 
+   * The universe will receive:
+   * 1. First: placeholder event (wallet=unknown, notional=0.01)
+   * 2. Then: enriched event with REAL data (actual wallet, actual SOL amount)
+   * 
+   * The rolling window will update metrics with the real data.
    */
   private async enrichSwapWithRpc(tokenMint: string, signature: string): Promise<void> {
     try {
@@ -390,15 +405,45 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
       this.rpcCounters.getParsedTransaction++;
       
       if (event && event.tokenMint === tokenMint) {
-        // Log enriched data for debugging
-        log.debug(`Enriched swap: ${signature.slice(0, 16)}...`, {
-          wallet: event.walletAddress.slice(0, 8),
-          notional: event.notionalSol.toString(),
-          direction: event.direction,
+        // Skip if wallet is still unknown (parsing failed)
+        if (event.walletAddress === 'unknown') {
+          log.debug(`Enrichment skipped (unknown wallet): ${tokenMint.slice(0, 12)}... sig=${signature.slice(0, 12)}`);
+          return;
+        }
+        
+        // Skip if notional is still placeholder-like (< 0.02 SOL)
+        if (event.notionalSol.lt(0.02)) {
+          log.debug(`Enrichment skipped (dust ${event.notionalSol.toString()} SOL): ${tokenMint.slice(0, 12)}... sig=${signature.slice(0, 12)}`);
+          return;
+        }
+        
+        // Log enriched data
+        log.info(`✅ ENRICHED: ${tokenMint.slice(0, 12)}... | ${event.direction} | ${event.notionalSol.toFixed(3)} SOL | ${event.walletAddress.slice(0, 8)}...`, {
+          signature: signature.slice(0, 16),
         });
+        
+        // Emit the ENRICHED event to update universe metrics!
+        // Use a special signature suffix to avoid dedup blocking
+        const enrichedEvent: SwapEvent = {
+          ...event,
+          signature: signature + '_enriched', // Differentiate from placeholder
+        };
+        
+        logEvent(LogEventType.SWAP_DETECTED, {
+          signature: enrichedEvent.signature,
+          tokenMint: enrichedEvent.tokenMint,
+          direction: enrichedEvent.direction,
+          notionalSol: enrichedEvent.notionalSol.toString(),
+          wallet: enrichedEvent.walletAddress,
+          dex: enrichedEvent.dexSource,
+          phase: 'meteora_raydium_enriched', // Mark as enriched
+        });
+        
+        this.emit('swap', enrichedEvent);
       }
-    } catch {
-      // Non-critical
+    } catch (error) {
+      // Non-critical - just log for debugging
+      log.debug(`Enrichment failed for ${signature.slice(0, 16)}...`);
     }
   }
   
@@ -540,6 +585,12 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
   
   /**
    * Emit a pump event directly (no tx parsing - P0-4)
+   * 
+   * FIX: For PUMPSWAP events, wallet is extracted via LIGHTWEIGHT signer call
+   * instead of expensive getParsedTransaction.
+   * 
+   * Per audit: "PUMPSWAP_TX_PARSE_CALLS (must stay 0)"
+   * We use getTransaction (not getParsedTransaction) to just get the signer.
    */
   private emitPumpEvent(candidate: Phase1Candidate): void {
     // DEDUPE: Skip if we already emitted this signature
@@ -583,6 +634,61 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     
     this.rpcCounters.pumpEventsEmittedNoTxParse++;
     this.emit('swap', event);
+    
+    // PUMPSWAP: Use LIGHTWEIGHT signer extraction (not expensive getParsedTransaction)
+    // Per audit: decode events from logs + lightweight signer = real data without estimates
+    if (candidate.dexSource === DEXSource.PUMPSWAP && candidate.wallet === 'unknown') {
+      this.enrichPumpSwapWithSigner(candidate.candidateAddress, candidate.signature, event);
+    }
+  }
+  
+  /**
+   * LIGHTWEIGHT: Enrich PumpSwap event with just the signer wallet
+   * 
+   * Uses getTransaction (not getParsedTransaction) to minimize RPC cost.
+   * We already have notional/direction from IDL - just need the signer.
+   */
+  private async enrichPumpSwapWithSigner(
+    tokenMint: string,
+    signature: string,
+    originalEvent: SwapEvent
+  ): Promise<void> {
+    try {
+      if (!this.connection) return;
+      
+      const signer = await extractSignerFromTransaction(this.connection, signature);
+      this.rpcCounters.getTransaction = (this.rpcCounters.getTransaction || 0) + 1;
+      
+      if (!signer) {
+        log.debug(`PumpSwap signer extraction failed: ${signature.slice(0, 16)}...`);
+        return;
+      }
+      
+      // Emit enriched event with real wallet
+      const enrichedEvent: SwapEvent = {
+        ...originalEvent,
+        walletAddress: signer,
+        signature: signature + '_signer', // Differentiate from original
+      };
+      
+      logEvent(LogEventType.SWAP_DETECTED, {
+        signature: enrichedEvent.signature,
+        tokenMint: enrichedEvent.tokenMint,
+        direction: enrichedEvent.direction,
+        notionalSol: enrichedEvent.notionalSol.toString(),
+        wallet: enrichedEvent.walletAddress,
+        dex: enrichedEvent.dexSource,
+        phase: 'pumpswap_signer_enriched', // New phase for tracking
+      });
+      
+      this.emit('swap', enrichedEvent);
+      
+      if (DEBUG) {
+        log.debug(`✅ PUMPSWAP SIGNER: ${tokenMint.slice(0, 12)}... | ${originalEvent.direction} | ${originalEvent.notionalSol.toFixed(3)} SOL | ${signer.slice(0, 8)}...`);
+      }
+    } catch (error) {
+      log.debug(`PumpSwap signer enrichment failed: ${signature.slice(0, 16)}...`);
+    }
   }
   
   // ═══════════════════════════════════════════════════════════════════
@@ -752,7 +858,7 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
   /**
    * Emit real events for a verified candidate
    * - If we have buffered events (from PUMPFUN/PUMPSWAP), flush them
-   * - If no buffered events (from non-pump DEX), parse signatures to get REAL data
+   * - If no buffered events (from non-pump DEX), use VENUE RESOLVER to find best parsing method
    * Returns number of tx parse calls made
    */
   private async emitRealEventsForCandidate(candidate: string): Promise<number> {
@@ -766,8 +872,6 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     }
     
     // No buffered events = came from non-pump DEX (METEORA, RAYDIUM, ORCA)
-    // Parse 1-3 signatures to get REAL wallet/direction/notional
-    // Parse up to 10 signatures to get substantial initial data
     const signatures = this.hotTokenTracker.getRecentSignatures(candidate, 10);
     
     if (signatures.length === 0) {
@@ -775,14 +879,53 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
       return 0;
     }
     
-    log.info(`📊 Parsing ${signatures.length} signatures for REAL data: ${candidate.slice(0, 16)}...`);
+    // ═══════════════════════════════════════════════════════════════
+    // VENUE RESOLUTION: Check observed venues for pump-origin tokens
+    // Uses observation cache (FREE - no RPC calls!)
+    // ═══════════════════════════════════════════════════════════════
+    
+    // Resolve best venue for this mint based on previous observations
+    const venueResolution = resolveVenueForMint(
+      candidate,
+      DEXSource.UNKNOWN, // We don't know the original source here
+      { preferPumpSwapForPumpMints: true }
+    );
+    
+    // If we've seen this token on PumpSwap, future events will come from PumpSwap subscription
+    // We still parse historical signatures for initial momentum data
+    
+    // Check connection before parsing
+    if (!this.connection) {
+      log.debug(`No connection for tx parsing`);
+      return 0;
+    }
+    
+    // ═══════════════════════════════════════════════════════════════
+    // PUMP-ORIGIN TOKENS: Skip signature parsing entirely!
+    // - PUMPFUN: Events have REAL wallets from IDL (TradeEvent includes user pubkey)
+    // - PUMPSWAP: Events have real notional, wallet from signer enrichment
+    // Both are already emitted via WebSocket - no need to parse signatures!
+    // ═══════════════════════════════════════════════════════════════
+    const observedOnPump = venueResolution.observedVenues?.includes(DEXSource.PUMPFUN) || 
+                           venueResolution.observedVenues?.includes(DEXSource.PUMPSWAP);
+    
+    if (observedOnPump || isPumpOriginMint(candidate)) {
+      log.info(`📊 PUMP token ${candidate.slice(0, 16)}... - events already emitted via WebSocket (no tx parsing needed)`);
+      return 0;
+    }
+    
+    log.info(`📊 Parsing ${signatures.length} signatures for REAL data: ${candidate.slice(0, 16)}... (venue: ${venueResolution.chosenVenue})`);
     
     let txParseCalls = 0;
     let eventsEmitted = 0;
     
-    for (const sig of signatures) {
+    // OPTIMIZATION: Limit to 3 signatures for expensive parsing
+    const maxSignatures = 3;
+    const sigsToProcess = signatures.slice(0, maxSignatures);
+    
+    for (const sig of sigsToProcess) {
       try {
-        const event = await parseTransactionWithHelius(this.connection!, sig, 0);
+        const event = await parseTransactionWithHelius(this.connection, sig, 0);
         txParseCalls++;
         this.rpcCounters.getParsedTransaction++;
         
@@ -811,6 +954,7 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
               wallet: event.walletAddress,
               dex: event.dexSource,
               phase: 'non_pump_tx_parsed',
+              venueResolution: venueResolution.reason,
             });
             
             this.emit('swap', event);
@@ -822,7 +966,7 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
       }
     }
     
-    log.info(`✅ Emitted ${eventsEmitted} REAL events for ${candidate.slice(0, 16)}... (${txParseCalls} tx parses)`);
+    log.info(`✅ Emitted ${eventsEmitted} REAL events for ${candidate.slice(0, 16)}... (${txParseCalls} tx parses, venue: ${venueResolution.chosenVenue})`);
     
     return txParseCalls;
   }
@@ -1038,6 +1182,7 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     logEvent(LogEventType.RPC_COUNTERS, {
       getParsedTransaction: this.rpcCounters.getParsedTransaction,
       getAccountInfo: this.rpcCounters.getAccountInfo,
+      getTransaction: this.rpcCounters.getTransaction, // PumpSwap signer extraction
       pumpEventsEmittedNoTxParse: this.rpcCounters.pumpEventsEmittedNoTxParse,
       phase1CandidatesSeen: trackerCounters.phase1CandidatesSeen,
       phase2Started: trackerCounters.phase2Started,
@@ -1049,6 +1194,7 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     
     log.info('📊 RPC COUNTERS', {
       getParsedTx: this.rpcCounters.getParsedTransaction,
+      getTx: this.rpcCounters.getTransaction, // PumpSwap signer (cheap)
       getAccountInfo: this.rpcCounters.getAccountInfo,
       pumpNoTxParse: this.rpcCounters.pumpEventsEmittedNoTxParse,
       phase2Started: trackerCounters.phase2Started,
@@ -1060,6 +1206,7 @@ export class EventListener extends EventEmitter<EventListenerEvents> {
     this.rpcCounters = {
       getParsedTransaction: 0,
       getAccountInfo: 0,
+      getTransaction: 0,
       pumpEventsEmittedNoTxParse: 0,
     };
   }
